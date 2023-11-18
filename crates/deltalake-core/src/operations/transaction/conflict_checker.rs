@@ -406,7 +406,7 @@ impl<'a> ConflictChecker<'a> {
             );
             if curr_read < win_read || win_write < curr_write {
                 return Err(CommitConflictError::ProtocolChanged(
-                    format!("reqired read/write {win_read}/{win_write}, current read/write {curr_read}/{curr_write}"),
+                    format!("required read/write {win_read}/{win_write}, current read/write {curr_read}/{curr_write}"),
                 ));
             };
         }
