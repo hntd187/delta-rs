@@ -23,7 +23,7 @@ use crate::kernel::{
     Action, Add as AddAction, DataType, Metadata, PrimitiveType, Protocol, StructField, StructType,
     Txn,
 };
-use crate::storage::DeltaObjectStore;
+use crate::logstore::LogStore;
 use crate::table::state::DeltaTableState;
 use crate::table::{CheckPoint, CheckPointBuilder};
 use crate::{open_table_with_version, DeltaTable};
@@ -37,6 +37,10 @@ enum CheckpointError {
     /// data type.
     #[error("Partition value {0} cannot be parsed from string.")]
     PartitionValueNotParseable(String),
+
+    /// Caller attempt to create a checkpoint for a version which does not exist on the table state
+    #[error("Attempted to create a checkpoint for a version {0} that does not match the table state {1}")]
+    StaleTableVersion(i64, i64),
 
     /// Error returned when the parquet writer fails while writing the checkpoint.
     #[error("Failed to write parquet: {}", .source)]
@@ -60,6 +64,7 @@ impl From<CheckpointError> for ProtocolError {
         match value {
             CheckpointError::PartitionValueNotParseable(_) => Self::InvalidField(value.to_string()),
             CheckpointError::Arrow { source } => Self::Arrow { source },
+            CheckpointError::StaleTableVersion(..) => Self::Generic(value.to_string()),
             CheckpointError::Parquet { source } => Self::ParquetParseError { source },
         }
     }
@@ -70,7 +75,7 @@ pub const CHECKPOINT_RECORD_BATCH_SIZE: usize = 5000;
 
 /// Creates checkpoint at current table version
 pub async fn create_checkpoint(table: &DeltaTable) -> Result<(), ProtocolError> {
-    create_checkpoint_for(table.version(), table.get_state(), table.storage.as_ref()).await?;
+    create_checkpoint_for(table.version(), table.get_state(), table.log_store.as_ref()).await?;
     Ok(())
 }
 
@@ -81,7 +86,7 @@ pub async fn cleanup_metadata(table: &DeltaTable) -> Result<usize, ProtocolError
         Utc::now().timestamp_millis() - table.get_state().log_retention_millis();
     cleanup_expired_logs_for(
         table.version(),
-        table.storage.as_ref(),
+        table.log_store.as_ref(),
         log_retention_timestamp,
     )
     .await
@@ -98,7 +103,7 @@ pub async fn create_checkpoint_from_table_uri_and_cleanup(
     let table = open_table_with_version(table_uri, version)
         .await
         .map_err(|err| ProtocolError::Generic(err.to_string()))?;
-    create_checkpoint_for(version, table.get_state(), table.storage.as_ref()).await?;
+    create_checkpoint_for(version, table.get_state(), table.log_store.as_ref()).await?;
 
     let enable_expired_log_cleanup =
         cleanup.unwrap_or_else(|| table.get_state().enable_expired_log_cleanup());
@@ -115,27 +120,36 @@ pub async fn create_checkpoint_from_table_uri_and_cleanup(
 pub async fn create_checkpoint_for(
     version: i64,
     state: &DeltaTableState,
-    storage: &DeltaObjectStore,
+    log_store: &dyn LogStore,
 ) -> Result<(), ProtocolError> {
+    if version != state.version() {
+        error!(
+            "create_checkpoint_for called with version {version} but table state contains: {}. The table state may need to be reloaded",
+            state.version()
+        );
+        return Err(CheckpointError::StaleTableVersion(version, state.version()).into());
+    }
+
     // TODO: checkpoints _can_ be multi-part... haven't actually found a good reference for
     // an appropriate split point yet though so only writing a single part currently.
     // See https://github.com/delta-io/delta-rs/issues/288
-    let last_checkpoint_path = storage.log_path().child("_last_checkpoint");
+    let last_checkpoint_path = log_store.log_path().child("_last_checkpoint");
 
     debug!("Writing parquet bytes to checkpoint buffer.");
     let (checkpoint, parquet_bytes) = parquet_bytes_from_state(state)?;
 
     let file_name = format!("{version:020}.checkpoint.parquet");
-    let checkpoint_path = storage.log_path().child(file_name);
+    let checkpoint_path = log_store.log_path().child(file_name);
 
+    let object_store = log_store.object_store();
     debug!("Writing checkpoint to {:?}.", checkpoint_path);
-    storage.put(&checkpoint_path, parquet_bytes).await?;
+    object_store.put(&checkpoint_path, parquet_bytes).await?;
 
     let last_checkpoint_content: Value = serde_json::to_value(checkpoint)?;
     let last_checkpoint_content = bytes::Bytes::from(serde_json::to_vec(&last_checkpoint_content)?);
 
     debug!("Writing _last_checkpoint to {:?}.", last_checkpoint_path);
-    storage
+    object_store
         .put(&last_checkpoint_path, last_checkpoint_content)
         .await?;
 
@@ -146,7 +160,7 @@ pub async fn create_checkpoint_for(
 /// and less than the specified version.
 pub async fn cleanup_expired_logs_for(
     until_version: i64,
-    storage: &DeltaObjectStore,
+    log_store: &dyn LogStore,
     cutoff_timestamp: i64,
 ) -> Result<usize, ProtocolError> {
     lazy_static! {
@@ -157,10 +171,11 @@ pub async fn cleanup_expired_logs_for(
     // Feed a stream of candidate deletion files directly into the delete_stream
     // function to try to improve the speed of cleanup and reduce the need for
     // intermediate memory.
-    let deleted = storage
+    let object_store = log_store.object_store();
+    let deleted = object_store
         .delete_stream(
-            storage
-                .list(Some(storage.log_path()))
+            object_store
+                .list(Some(log_store.log_path()))
                 .await?
                 // This predicate function will filter out any locations that don't
                 // match the given timestamp range
@@ -483,6 +498,72 @@ mod tests {
     use super::*;
     use lazy_static::lazy_static;
     use serde_json::json;
+
+    use crate::operations::DeltaOps;
+    use crate::writer::test_utils::get_delta_schema;
+    use object_store::path::Path;
+
+    #[tokio::test]
+    async fn test_create_checkpoint_for() {
+        let table_schema = get_delta_schema();
+
+        let table = DeltaOps::new_in_memory()
+            .create()
+            .with_columns(table_schema.fields().clone())
+            .with_save_mode(crate::protocol::SaveMode::Ignore)
+            .await
+            .unwrap();
+        assert_eq!(table.version(), 0);
+        assert_eq!(table.get_metadata().unwrap().schema, table_schema);
+        let res = create_checkpoint_for(0, table.get_state(), table.log_store.as_ref()).await;
+        assert!(res.is_ok());
+
+        // Look at the "files" and verify that the _last_checkpoint has the right version
+        let path = Path::from("_delta_log/_last_checkpoint");
+        let last_checkpoint = table
+            .object_store()
+            .get(&path)
+            .await
+            .expect("Failed to get the _last_checkpoint")
+            .bytes()
+            .await
+            .expect("Failed to get bytes for _last_checkpoint");
+        let last_checkpoint: CheckPoint = serde_json::from_slice(&last_checkpoint).expect("Fail");
+        assert_eq!(last_checkpoint.version, 0);
+    }
+
+    #[tokio::test]
+    async fn test_create_checkpoint_for_invalid_version() {
+        let table_schema = get_delta_schema();
+
+        let table = DeltaOps::new_in_memory()
+            .create()
+            .with_columns(table_schema.fields().clone())
+            .with_save_mode(crate::protocol::SaveMode::Ignore)
+            .await
+            .unwrap();
+        assert_eq!(table.version(), 0);
+        assert_eq!(table.get_metadata().unwrap().schema, table_schema);
+        match create_checkpoint_for(1, table.get_state(), table.log_store.as_ref()).await {
+            Ok(_) => {
+                /*
+                 * If a checkpoint is allowed to be created here, it will use the passed in
+                 * version, but _last_checkpoint is generated from the table state will point to a
+                 * version 0 checkpoint.
+                 * E.g.
+                 *
+                 * Path { raw: "_delta_log/00000000000000000000.json" }
+                 * Path { raw: "_delta_log/00000000000000000001.checkpoint.parquet" }
+                 * Path { raw: "_delta_log/_last_checkpoint" }
+                 *
+                 */
+                panic!(
+                    "We should not allow creating a checkpoint for a version which doesn't exist!"
+                );
+            }
+            Err(_) => { /* We should expect an error in the "right" case */ }
+        }
+    }
 
     #[test]
     fn typed_partition_value_from_string_test() {

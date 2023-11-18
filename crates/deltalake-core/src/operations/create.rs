@@ -7,12 +7,11 @@ use std::sync::Arc;
 use futures::future::BoxFuture;
 use serde_json::{Map, Value};
 
-use super::transaction::commit;
-use super::{MAX_SUPPORTED_READER_VERSION, MAX_SUPPORTED_WRITER_VERSION};
+use super::transaction::{commit, PROTOCOL};
 use crate::errors::{DeltaResult, DeltaTableError};
 use crate::kernel::{Action, DataType, Metadata, Protocol, StructField, StructType};
+use crate::logstore::{LogStore, LogStoreRef};
 use crate::protocol::{DeltaOperation, SaveMode};
-use crate::storage::DeltaObjectStore;
 use crate::table::builder::ensure_table_uri;
 use crate::table::config::DeltaConfigKey;
 use crate::table::DeltaTableMetaData;
@@ -55,7 +54,7 @@ pub struct CreateBuilder {
     partition_columns: Option<Vec<String>>,
     storage_options: Option<HashMap<String, String>>,
     actions: Vec<Action>,
-    object_store: Option<Arc<DeltaObjectStore>>,
+    log_store: Option<LogStoreRef>,
     configuration: HashMap<String, Option<String>>,
     metadata: Option<Map<String, Value>>,
 }
@@ -78,7 +77,7 @@ impl CreateBuilder {
             partition_columns: None,
             storage_options: None,
             actions: Default::default(),
-            object_store: None,
+            log_store: None,
             configuration: Default::default(),
             metadata: Default::default(),
         }
@@ -198,9 +197,9 @@ impl CreateBuilder {
         self
     }
 
-    /// Provide a [`DeltaObjectStore`] instance, that points at table location
-    pub fn with_object_store(mut self, object_store: Arc<DeltaObjectStore>) -> Self {
-        self.object_store = Some(object_store);
+    /// Provide a [`LogStore`] instance, that points at table location
+    pub fn with_log_store(mut self, log_store: Arc<dyn LogStore>) -> Self {
+        self.log_store = Some(log_store);
         self
     }
 
@@ -219,12 +218,10 @@ impl CreateBuilder {
             return Err(CreateError::MissingSchema.into());
         }
 
-        let (storage_url, table) = if let Some(object_store) = self.object_store {
+        let (storage_url, table) = if let Some(log_store) = self.log_store {
             (
-                ensure_table_uri(object_store.root_uri())?
-                    .as_str()
-                    .to_string(),
-                DeltaTable::new(object_store, Default::default()),
+                ensure_table_uri(log_store.root_uri())?.as_str().to_string(),
+                DeltaTable::new(log_store, Default::default()),
             )
         } else {
             let storage_url = ensure_table_uri(self.location.ok_or(CreateError::MissingLocation)?)?;
@@ -247,8 +244,8 @@ impl CreateBuilder {
                 _ => unreachable!(),
             })
             .unwrap_or_else(|| Protocol {
-                min_reader_version: MAX_SUPPORTED_READER_VERSION,
-                min_writer_version: MAX_SUPPORTED_WRITER_VERSION,
+                min_reader_version: PROTOCOL.default_reader_version(),
+                min_writer_version: PROTOCOL.default_writer_version(),
                 writer_features: None,
                 reader_features: None,
             });
@@ -293,7 +290,8 @@ impl std::future::IntoFuture for CreateBuilder {
         Box::pin(async move {
             let mode = this.mode.clone();
             let (mut table, actions, operation) = this.into_table_and_actions()?;
-            let table_state = if table.object_store().is_delta_table_location().await? {
+            let log_store = table.log_store();
+            let table_state = if log_store.is_delta_table_location().await? {
                 match mode {
                     SaveMode::ErrorIfExists => return Err(CreateError::TableAlreadyExists.into()),
                     SaveMode::Append => return Err(CreateError::AppendNotAllowed.into()),
@@ -311,7 +309,7 @@ impl std::future::IntoFuture for CreateBuilder {
             };
 
             let version = commit(
-                table.object_store().as_ref(),
+                table.log_store.as_ref(),
                 &actions,
                 operation,
                 table_state,
@@ -392,8 +390,14 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(table.version(), 0);
-        assert_eq!(table.get_min_reader_version(), MAX_SUPPORTED_READER_VERSION);
-        assert_eq!(table.get_min_writer_version(), MAX_SUPPORTED_WRITER_VERSION);
+        assert_eq!(
+            table.get_min_reader_version(),
+            PROTOCOL.default_reader_version()
+        );
+        assert_eq!(
+            table.get_min_writer_version(),
+            PROTOCOL.default_writer_version()
+        );
         assert_eq!(table.schema().unwrap(), &schema);
 
         // check we can overwrite default settings via adding actions
@@ -443,11 +447,11 @@ mod tests {
         assert_eq!(table.version(), 0);
         let first_id = table.get_metadata().unwrap().id.clone();
 
-        let object_store = table.object_store();
+        let log_store = table.log_store;
 
         // Check an error is raised when a table exists at location
         let table = CreateBuilder::new()
-            .with_object_store(object_store.clone())
+            .with_log_store(log_store.clone())
             .with_columns(schema.fields().clone())
             .with_save_mode(SaveMode::ErrorIfExists)
             .await;
@@ -455,7 +459,7 @@ mod tests {
 
         // Check current table is returned when ignore option is chosen.
         let table = CreateBuilder::new()
-            .with_object_store(object_store.clone())
+            .with_log_store(log_store.clone())
             .with_columns(schema.fields().clone())
             .with_save_mode(SaveMode::Ignore)
             .await
@@ -464,7 +468,7 @@ mod tests {
 
         // Check table is overwritten
         let table = CreateBuilder::new()
-            .with_object_store(object_store.clone())
+            .with_log_store(log_store)
             .with_columns(schema.fields().iter().cloned())
             .with_save_mode(SaveMode::Overwrite)
             .await

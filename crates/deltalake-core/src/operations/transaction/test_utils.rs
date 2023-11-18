@@ -1,11 +1,12 @@
 #![allow(unused)]
 use std::collections::HashMap;
 
-use super::{prepare_commit, try_commit_transaction};
+use super::prepare_commit;
 use crate::kernel::{
     Action, Add, CommitInfo, DataType, Metadata, PrimitiveType, Protocol, Remove, StructField,
     StructType,
 };
+use crate::operations::transaction::PROTOCOL;
 use crate::protocol::{DeltaOperation, SaveMode};
 use crate::table::state::DeltaTableState;
 use crate::table::DeltaTableMetaData;
@@ -49,8 +50,8 @@ pub fn create_remove_action(path: impl Into<String>, data_change: bool) -> Actio
 
 pub fn create_protocol_action(max_reader: Option<i32>, max_writer: Option<i32>) -> Action {
     let protocol = Protocol {
-        min_reader_version: max_reader.unwrap_or(crate::operations::MAX_SUPPORTED_READER_VERSION),
-        min_writer_version: max_writer.unwrap_or(crate::operations::MAX_SUPPORTED_WRITER_VERSION),
+        min_reader_version: max_reader.unwrap_or(PROTOCOL.default_reader_version()),
+        min_writer_version: max_writer.unwrap_or(PROTOCOL.default_writer_version()),
         writer_features: None,
         reader_features: None,
     };
@@ -121,7 +122,7 @@ pub async fn create_initialized_table(
     partition_cols: &[String],
     configuration: Option<HashMap<String, Option<String>>>,
 ) -> DeltaTable {
-    let storage = DeltaTableBuilder::from_uri("memory://")
+    let log_store = DeltaTableBuilder::from_uri("memory://")
         .build_storage()
         .unwrap();
     let table_schema = StructType::new(vec![
@@ -161,11 +162,18 @@ pub async fn create_initialized_table(
         ),
     };
     let actions = init_table_actions(None);
-    let prepared_commit = prepare_commit(storage.as_ref(), &operation, &actions, &state, None)
+    let prepared_commit = prepare_commit(
+        log_store.object_store().as_ref(),
+        &operation,
+        &actions,
+        None,
+    )
+    .await
+    .unwrap();
+
+    log_store
+        .write_commit_entry(0, &prepared_commit)
         .await
         .unwrap();
-    try_commit_transaction(storage.as_ref(), &prepared_commit, 0)
-        .await
-        .unwrap();
-    DeltaTable::new_with_state(storage, state)
+    DeltaTable::new_with_state(log_store, state)
 }
