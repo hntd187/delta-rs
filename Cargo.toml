@@ -27,7 +27,7 @@ arrow-cast = { version = "48.0.1" }
 arrow-ord = { version = "48.0.1" }
 arrow-row = { version = "48.0.1" }
 arrow-schema = { version = "48.0.1" }
-arrow-select = { version = "48.0.1" }
+arrow-select = { version = "49.0.0" }
 parquet = { version = "48.0.1" }
 
 # datafusion
