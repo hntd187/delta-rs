@@ -1,7 +1,10 @@
 //! Constraints and generated column mappings
 use crate::kernel::DataType;
 use crate::table::DataCheck;
+use crate::{DeltaResult, DeltaTableError};
+use arrow_schema::Field;
 use std::any::Any;
+use std::collections::HashMap;
 
 /// A constraint in a check constraint
 #[derive(Eq, PartialEq, Debug, Default, Clone)]
@@ -76,5 +79,87 @@ impl DataCheck for GeneratedColumn {
 
     fn as_any(&self) -> &dyn Any {
         self
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct IdentityColumn {
+    name: String,
+    start: Option<i64>,
+    step: Option<i64>,
+    high_watermark: Option<i64>,
+    allow_explicit_insert: Option<bool>,
+}
+
+impl IdentityColumn {
+    pub fn new(
+        name: String,
+        start: Option<i64>,
+        step: Option<i64>,
+        high_watermark: Option<i64>,
+        allow_explicit_insert: Option<bool>,
+    ) -> Self {
+        Self {
+            name,
+            start,
+            step,
+            high_watermark,
+            allow_explicit_insert,
+        }
+    }
+
+    pub fn get_name(&self) -> &str {
+        self.name.as_str()
+    }
+
+    pub fn generate_range(&mut self, num_rows: i64) -> DeltaResult<impl Iterator<Item = i64>> {
+        if let Some(start) = self.start {
+            if let Some(step) = self.step {
+                // If we have a watermark, step once so we don't overlap the first and last value
+                // of the last commit
+                let low = self.high_watermark.map(|wm| wm + step).unwrap_or(start);
+                let high = self.high_watermark.unwrap_or(0) + num_rows;
+                dbg!(low, high, num_rows, self.high_watermark);
+                self.high_watermark = Some(high);
+                return Ok((low..=high).step_by(step as usize));
+            }
+        }
+        Err(DeltaTableError::Generic(format!(
+            "Invalid identity column: {:?}",
+            self
+        )))
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.start.is_none()
+            && self.step.is_none()
+            && self.high_watermark.is_none()
+            && self.allow_explicit_insert.is_none()
+    }
+}
+
+impl Into<Field> for IdentityColumn {
+    fn into(self) -> Field {
+        let mut metadata = HashMap::new();
+        if let Some(start) = self.start {
+            metadata.insert("delta.identity.start".to_string(), start.to_string());
+        }
+        if let Some(step) = self.step {
+            metadata.insert("delta.identity.step".to_string(), step.to_string());
+        }
+        if let Some(watermark) = self.high_watermark {
+            metadata.insert(
+                "delta.identity.highWaterMark".to_string(),
+                watermark.to_string(),
+            );
+        }
+        if let Some(allow_insert) = self.allow_explicit_insert {
+            metadata.insert(
+                "delta.identity.allowExplicitInsert".to_string(),
+                allow_insert.to_string(),
+            );
+        }
+
+        Field::new(self.name, arrow_schema::DataType::Int64, false).with_metadata(metadata)
     }
 }

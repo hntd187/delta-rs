@@ -27,6 +27,7 @@ pub(crate) mod async_utils;
 pub mod configs;
 pub(crate) mod execution;
 pub(crate) mod generated_columns;
+pub(crate) mod identity_columns;
 pub(crate) mod metrics;
 pub(crate) mod schema_evolution;
 pub mod writer;
@@ -71,6 +72,7 @@ use crate::kernel::transaction::{CommitBuilder, CommitProperties, TableReference
 use crate::kernel::{Action, ActionType, Metadata, StructType, StructTypeExt};
 use crate::logstore::LogStoreRef;
 use crate::operations::cast::merge_schema::merge_arrow_schema;
+use crate::operations::write::identity_columns::can_write_identity_column;
 use crate::protocol::{DeltaOperation, SaveMode};
 use crate::table::state::DeltaTableState;
 use crate::DeltaTable;
@@ -315,6 +317,7 @@ impl WriteBuilder {
     pub fn with_input_batches(mut self, batches: impl IntoIterator<Item = RecordBatch>) -> Self {
         let ctx = SessionContext::new();
         let batches: Vec<RecordBatch> = batches.into_iter().collect();
+
         if !batches.is_empty() {
             let table_provider: Arc<dyn TableProvider> =
                 Arc::new(MemTable::try_new(batches[0].schema(), vec![batches]).unwrap());
@@ -429,7 +432,6 @@ impl std::future::IntoFuture for WriteBuilder {
             // Create table actions to initialize table in case it does not yet exist
             // and should be created
             let mut actions = this.check_preconditions().await?;
-
             let partition_columns = this.get_partition_columns()?;
 
             let state = match this.state {
@@ -458,6 +460,10 @@ impl std::future::IntoFuture for WriteBuilder {
                     source = source_with_gc;
                     missing_gen_col = Some(missing_generated_columns);
                     generated_col_exp = Some(generated_col_expressions);
+                }
+                if can_write_identity_column(snapshot)? {
+                    let id_columns = snapshot.schema().get_identity_columns()?;
+                    for id_col in id_columns {}
                 }
             }
 

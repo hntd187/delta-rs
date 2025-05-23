@@ -65,18 +65,22 @@ pub fn sort_record_batch(batch: RecordBatch) -> DeltaResult<RecordBatch> {
 //  - data type: This is checked already in `assert_columns_match`
 //  - nullability: parquet marks many things as nullable that we don't in our schema
 //  - metadata: because that diverges from the real data to the golden tabled data
+#[allow(deprecated)]
 fn assert_schema_fields_match(schema: &Schema, golden: &Schema) {
     for (schema_field, golden_field) in schema.fields.iter().zip(golden.fields.iter()) {
-        assert!(
-            schema_field.name() == golden_field.name(),
+        assert_eq!(
+            schema_field.name(),
+            golden_field.name(),
             "Field names don't match"
         );
-        assert!(
-            schema_field.dict_id() == golden_field.dict_id(),
+        assert_eq!(
+            schema_field.dict_id(),
+            golden_field.dict_id(),
             "Field dict_id doesn't match"
         );
-        assert!(
-            schema_field.dict_is_ordered() == golden_field.dict_is_ordered(),
+        assert_eq!(
+            schema_field.dict_is_ordered(),
+            golden_field.dict_is_ordered(),
             "Field dict_is_ordered doesn't match"
         );
     }

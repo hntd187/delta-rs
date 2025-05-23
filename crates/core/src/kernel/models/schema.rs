@@ -11,7 +11,7 @@ use serde_json::Value;
 
 use crate::kernel::error::Error;
 use crate::kernel::DataCheck;
-use crate::table::GeneratedColumn;
+use crate::table::{GeneratedColumn, IdentityColumn};
 
 /// Type alias for a top level schema
 pub type Schema = StructType;
@@ -58,56 +58,10 @@ pub trait StructTypeExt {
 
     /// Get all generated column expressions
     fn get_generated_columns(&self) -> Result<Vec<GeneratedColumn>, Error>;
+    fn get_identity_columns(&self) -> Result<Vec<IdentityColumn>, Error>;
 }
 
 impl StructTypeExt for StructType {
-    /// Get all get_generated_columns in the schemas
-    fn get_generated_columns(&self) -> Result<Vec<GeneratedColumn>, Error> {
-        let mut remaining_fields: Vec<(String, StructField)> = self
-            .fields()
-            .map(|field| (field.name.clone(), field.clone()))
-            .collect();
-        let mut generated_cols: Vec<GeneratedColumn> = Vec::new();
-
-        while let Some((field_path, field)) = remaining_fields.pop() {
-            if let Some(MetadataValue::String(generated_col_string)) = field
-                .metadata
-                .get(ColumnMetadataKey::GenerationExpression.as_ref())
-            {
-                let json: Value = serde_json::from_str(generated_col_string).map_err(|e| {
-                    Error::InvalidGenerationExpressionJson {
-                        json_err: e,
-                        line: generated_col_string.to_string(),
-                    }
-                })?;
-                match json {
-                    Value::String(sql) => generated_cols.push(GeneratedColumn::new(
-                        &field_path,
-                        &sql,
-                        field.data_type(),
-                    )),
-                    Value::Number(sql) => generated_cols.push(GeneratedColumn::new(
-                        &field_path,
-                        &format!("{sql}"),
-                        field.data_type(),
-                    )),
-                    Value::Bool(sql) => generated_cols.push(GeneratedColumn::new(
-                        &field_path,
-                        &format!("{sql}"),
-                        field.data_type(),
-                    )),
-                    Value::Array(sql) => generated_cols.push(GeneratedColumn::new(
-                        &field_path,
-                        &format!("{sql:?}"),
-                        field.data_type(),
-                    )),
-                    _ => (), // Other types not sure what to do then
-                };
-            }
-        }
-        Ok(generated_cols)
-    }
-
     /// Get all invariants in the schemas
     fn get_invariants(&self) -> Result<Vec<Invariant>, Error> {
         let mut remaining_fields: Vec<(String, StructField)> = self
@@ -178,6 +132,100 @@ impl StructTypeExt for StructType {
             }
         }
         Ok(invariants)
+    }
+
+    /// Get all get_generated_columns in the schemas
+    fn get_generated_columns(&self) -> Result<Vec<GeneratedColumn>, Error> {
+        let mut remaining_fields: Vec<(String, StructField)> = self
+            .fields()
+            .map(|field| (field.name.clone(), field.clone()))
+            .collect();
+        let mut generated_cols: Vec<GeneratedColumn> = Vec::new();
+
+        while let Some((field_path, field)) = remaining_fields.pop() {
+            if let Some(MetadataValue::String(generated_col_string)) = field
+                .metadata
+                .get(ColumnMetadataKey::GenerationExpression.as_ref())
+            {
+                let json: Value = serde_json::from_str(generated_col_string).map_err(|e| {
+                    Error::InvalidGenerationExpressionJson {
+                        json_err: e,
+                        line: generated_col_string.to_string(),
+                    }
+                })?;
+                match json {
+                    Value::String(sql) => generated_cols.push(GeneratedColumn::new(
+                        &field_path,
+                        &sql,
+                        field.data_type(),
+                    )),
+                    Value::Number(sql) => generated_cols.push(GeneratedColumn::new(
+                        &field_path,
+                        &format!("{sql}"),
+                        field.data_type(),
+                    )),
+                    Value::Bool(sql) => generated_cols.push(GeneratedColumn::new(
+                        &field_path,
+                        &format!("{sql}"),
+                        field.data_type(),
+                    )),
+                    Value::Array(sql) => generated_cols.push(GeneratedColumn::new(
+                        &field_path,
+                        &format!("{sql:?}"),
+                        field.data_type(),
+                    )),
+                    _ => (), // Other types not sure what to do then
+                };
+            }
+        }
+        Ok(generated_cols)
+    }
+
+    fn get_identity_columns(&self) -> Result<Vec<IdentityColumn>, Error> {
+        use ColumnMetadataKey::*;
+        let mut identity_columns = vec![];
+        for field in self.fields() {
+            let start = field
+                .metadata()
+                .get(IdentityStart.as_ref())
+                .and_then(|mv| match mv {
+                    MetadataValue::Number(n) => Some(*n),
+                    _ => None,
+                });
+            let step = field
+                .metadata()
+                .get(IdentityStep.as_ref())
+                .and_then(|mv| match mv {
+                    MetadataValue::Number(n) => Some(*n),
+                    _ => None,
+                });
+            let high_watermark = field
+                .metadata()
+                .get(IdentityHighWaterMark.as_ref())
+                .and_then(|mv| match mv {
+                    MetadataValue::Number(n) => Some(*n),
+                    _ => None,
+                });
+            let allow_explicit_insert = field
+                .metadata()
+                .get(IdentityAllowExplicitInsert.as_ref())
+                .and_then(|mv| match mv {
+                    MetadataValue::Boolean(n) => Some(*n),
+                    _ => None,
+                });
+            let maybe_identity_column = IdentityColumn::new(
+                field.name().clone(),
+                start,
+                step,
+                high_watermark,
+                allow_explicit_insert,
+            );
+            if !maybe_identity_column.is_empty() {
+                identity_columns.push(maybe_identity_column);
+            }
+        }
+
+        Ok(identity_columns)
     }
 }
 
@@ -294,6 +342,9 @@ mod tests {
     #[test]
     fn test_identity_columns() {
         let buf = r#"{"type":"struct","fields":[{"name":"ID_D_DATE","type":"long","nullable":true,"metadata":{"delta.identity.start":1,"delta.identity.step":1,"delta.identity.allowExplicitInsert":false}},{"name":"TXT_DateKey","type":"string","nullable":true,"metadata":{}}]}"#;
-        let _schema: StructType = serde_json::from_str(buf).expect("Failed to load");
+        let schema: StructType = serde_json::from_str(buf).expect("Failed to load");
+        let id_cols = schema.get_identity_columns().unwrap();
+        assert_eq!(id_cols.len(), 1);
+        assert_eq!(id_cols[0].get_name(), "ID_D_DATE");
     }
 }
