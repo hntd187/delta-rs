@@ -194,7 +194,7 @@ pub enum OptimizeType {
 /// Optimize a Delta table with given options
 ///
 /// If a target file size is not provided then `delta.targetFileSize` from the
-/// table's configuration is read. Otherwise a default value is used.
+/// table's configuration is read. Otherwise, a default value is used.
 pub struct OptimizeBuilder<'a> {
     /// A snapshot of the to-be-optimized table's state
     snapshot: Option<EagerSnapshot>,

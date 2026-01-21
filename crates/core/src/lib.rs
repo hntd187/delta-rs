@@ -92,6 +92,9 @@ pub mod test_utils;
 
 #[cfg(feature = "datafusion")]
 pub mod delta_datafusion;
+
+#[cfg(feature = "spark-connect")]
+pub mod delta_spark_connect;
 pub mod writer;
 
 use std::collections::HashMap;
