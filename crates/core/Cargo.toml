@@ -16,6 +16,7 @@ features = ["datafusion", "json"]
 
 [dependencies]
 deltalake-derive = { version = "0.30.0", path = "../derive" }
+deltalake-spark-connect = { path = "../spark-connect", optional = true }
 
 delta_kernel.workspace = true
 
@@ -112,7 +113,7 @@ python = ["arrow/pyarrow"]
 native-tls = ["delta_kernel/default-engine-native-tls"]
 rustls = ["delta_kernel/default-engine-rustls"]
 cloud = ["object_store/cloud", "dep:humantime"]
-spark-connect = []
+spark-connect = ["deltalake-spark-connect"]
 
 # enable caching some file I/O operations when scanning delta logs
 delta-cache = ["foyer", "tempfile", "url/serde"]

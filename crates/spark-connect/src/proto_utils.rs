@@ -6,7 +6,9 @@ use crate::proto::spark::command::CommandType;
 use crate::proto::spark::data_type::Kind;
 use crate::proto::spark::plan::OpType;
 use crate::proto::spark::relation::RelType;
-use crate::proto::spark::{Command, DataType, ExecutePlanRequest, Plan, Relation, data_type};
+use crate::proto::spark::{
+    Command, DataType, ExecutePlanRequest, Limit, Plan, Relation, data_type,
+};
 use crate::proto::{
     DeltaCommand, DeltaRelation, DeltaTable, DescribeDetail, DescribeHistory, Scan,
 };
@@ -133,17 +135,37 @@ pub fn build_delta_relation(msg: RelationType) -> ConnectResult<DeltaRelation> {
     })
 }
 
-pub fn build_spark_relation(delta_relation: DeltaRelation) -> ConnectResult<ExecutePlanRequest> {
+pub fn with_limit(rel: Relation, limit: Option<i32>) -> OpType {
+    if let Some(limit) = limit {
+        let limit = Limit {
+            input: Some(Box::new(rel)),
+            limit,
+        };
+        OpType::Root(Relation {
+            common: None,
+            rel_type: Some(RelType::Limit(Box::new(limit))),
+        })
+    } else {
+        OpType::Root(rel)
+    }
+}
+
+pub fn build_spark_relation(
+    session_id: String,
+    delta_relation: DeltaRelation,
+    limit: Option<i32>,
+) -> ConnectResult<ExecutePlanRequest> {
     let rel = Relation {
         common: None,
         rel_type: Some(RelType::Extension(Any::from_msg(&delta_relation)?)),
     };
+    let rel_type = with_limit(rel, limit);
+
     let plan = Plan {
-        op_type: Some(OpType::Root(rel)),
+        op_type: Some(rel_type),
     };
-    let id = uuid::Uuid::new_v4();
     Ok(ExecutePlanRequest {
-        session_id: id.to_string(),
+        session_id,
         plan: Some(plan),
         ..Default::default()
     })

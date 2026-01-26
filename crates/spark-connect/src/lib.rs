@@ -9,6 +9,7 @@ use crate::proto::spark::execute_plan_response::{ExecutionProgress, Metrics, Res
 use tonic::client::GrpcService;
 use tonic::codegen::StdError;
 use tonic::{Status, Streaming};
+use uuid::Uuid;
 
 pub mod proto {
     pub mod spark {
@@ -23,7 +24,6 @@ mod proto_utils;
 
 use crate::connect_error::ConnectError;
 use crate::proto::CreateDeltaTable;
-use crate::proto::create_delta_table::{Column, Mode};
 use proto_utils::*;
 
 pub type ConnectResult<R> = Result<R, ConnectError>;
@@ -36,6 +36,7 @@ where
     <T::ResponseBody as tonic::codegen::Body>::Error: Into<StdError> + Send,
 {
     session: SparkConnectServiceClient<T>,
+    session_id: Uuid,
     response_handler: ResponseHandler,
 }
 
@@ -57,8 +58,11 @@ where
     <T::ResponseBody as tonic::codegen::Body>::Error: Into<StdError> + Send,
 {
     pub fn new(session: SparkConnectServiceClient<T>) -> Self {
+        let session_id = Uuid::new_v4();
+
         Self {
             session,
+            session_id,
             response_handler: ResponseHandler::default(),
         }
     }
@@ -66,7 +70,7 @@ where
     pub async fn describe_history(&mut self, path: String) -> ConnectResult<Vec<RecordBatch>> {
         let table = build_describe_history(build_table(path))?;
         let relation = build_delta_relation(RelationType::DescribeHistory(table))?;
-        let request = build_spark_relation(relation)?;
+        let request = build_spark_relation(self.session_id.to_string(), relation, None)?;
         self.execute(request).await?;
         Ok(std::mem::take(&mut self.response_handler.batches))
     }
@@ -74,35 +78,40 @@ where
     pub async fn describe_detail(&mut self, path: String) -> ConnectResult<Vec<RecordBatch>> {
         let table = build_describe_detail(build_table(path))?;
         let relation = build_delta_relation(RelationType::DescribeDetail(table))?;
-        let request = build_spark_relation(relation)?;
+        let request = build_spark_relation(self.session_id.to_string(), relation, None)?;
         self.execute(request).await?;
         Ok(std::mem::take(&mut self.response_handler.batches))
     }
 
-    pub async fn scan(&mut self, path: String) -> ConnectResult<Vec<RecordBatch>> {
+    pub async fn scan(
+        &mut self,
+        path: String,
+        limit: Option<i32>,
+    ) -> ConnectResult<Vec<RecordBatch>> {
         let table = build_delta_scan(build_table(path))?;
         let relation = build_delta_relation(RelationType::Scan(table))?;
-        let request = build_spark_relation(relation)?;
+        let request = build_spark_relation(self.session_id.to_string(), relation, limit)?;
         self.execute(request).await?;
         Ok(std::mem::take(&mut self.response_handler.batches))
     }
 
-    // pub async fn create_table<C: Into<Column>>(&mut self, create_delta_table: CreateDeltaTable) -> ConnectResult<Vec<RecordBatch>> {
-    //
-    //
-    // }
+    pub async fn create_table(
+        &mut self,
+        create_delta_table: CreateDeltaTable,
+    ) -> ConnectResult<Vec<RecordBatch>> {
+    }
 
     async fn execute(&mut self, plan: ExecutePlanRequest) -> ConnectResult<()> {
-        let mut stream = self.session.execute_plan(plan).await?.into_inner();
-        self.process_stream(&mut stream).await
+        let stream = self.session.execute_plan(plan).await?.into_inner();
+        self.process_stream(stream).await
     }
 
     async fn process_stream(
         &mut self,
-        stream: &mut Streaming<ExecutePlanResponse>,
+        mut stream: Streaming<ExecutePlanResponse>,
     ) -> ConnectResult<()> {
-        while let Ok(Some(_resp)) = stream.message().await {
-            self.handle_response(_resp)?;
+        while let Ok(Some(resp)) = stream.message().await {
+            self.handle_response(resp)?;
         }
         Ok(())
     }
@@ -150,7 +159,7 @@ pub mod test {
         let client = SparkConnectServiceClient::connect("sc://localhost:15002").await?;
         let mut session = SparkSession::new(client);
         let batches = session
-            .scan("/mnt/c/Users/shcar/RustroverProjects/delta-rs/crates/test/tests/data/checkpoint-v2-table/".to_string())
+            .scan("/mnt/c/Users/shcar/RustroverProjects/delta-rs/crates/test/tests/data/checkpoint-v2-table/".to_string(), None)
             .await;
         if batches.is_err() {
             match batches.unwrap_err() {

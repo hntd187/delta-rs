@@ -53,20 +53,20 @@ impl From<CreateError> for DeltaTableError {
 /// Build an operation to create a new [DeltaTable]
 #[derive(Clone)]
 pub struct CreateBuilder {
-    name: Option<String>,
-    location: Option<String>,
-    mode: SaveMode,
-    comment: Option<String>,
-    columns: Vec<StructField>,
-    partition_columns: Option<Vec<String>>,
-    storage_options: Option<HashMap<String, String>>,
-    actions: Vec<Action>,
-    log_store: Option<LogStoreRef>,
-    configuration: HashMap<String, Option<String>>,
+    pub(crate) name: Option<String>,
+    pub(crate) location: Option<String>,
+    pub(crate) mode: SaveMode,
+    pub(crate) comment: Option<String>,
+    pub(crate) columns: Vec<StructField>,
+    pub(crate) partition_columns: Option<Vec<String>>,
+    pub(crate) storage_options: Option<HashMap<String, String>>,
+    pub(crate) actions: Vec<Action>,
+    pub(crate) log_store: Option<LogStoreRef>,
+    pub(crate) configuration: HashMap<String, Option<String>>,
     /// Additional information to add to the commit
-    commit_properties: CommitProperties,
-    raise_if_key_not_exists: bool,
-    custom_execute_handler: Option<Arc<dyn CustomExecuteHandler>>,
+    pub(crate) commit_properties: CommitProperties,
+    pub(crate) raise_if_key_not_exists: bool,
+    pub(crate) custom_execute_handler: Option<Arc<dyn CustomExecuteHandler>>,
 }
 
 impl super::Operation for CreateBuilder {
