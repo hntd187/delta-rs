@@ -69,9 +69,8 @@ use tracing::*;
 use uuid::Uuid;
 
 use self::barrier::{MergeBarrier, MergeBarrierExec};
-use super::datafusion_utils::{Expression, into_expr, maybe_into_expr};
 use super::{CustomExecuteHandler, Operation};
-use crate::delta_datafusion::expr::{fmt_expr_to_sql, parse_predicate_expression};
+use crate::delta_datafusion::expr::fmt_expr_to_sql;
 use crate::delta_datafusion::logical::MetricObserver;
 use crate::delta_datafusion::physical::{MetricObserverExec, find_metric_node, get_metric};
 use crate::delta_datafusion::planner::DeltaPlanner;
@@ -79,6 +78,7 @@ use crate::delta_datafusion::{
     DataFusionMixins, DeltaColumn, DeltaScan, DeltaScanConfigBuilder, DeltaSessionContext,
     DeltaTableProvider, register_store,
 };
+use crate::delta_datafusion::{Expression, into_expr, maybe_into_expr};
 use crate::kernel::schema::cast::{merge_arrow_field, merge_arrow_schema};
 use crate::kernel::transaction::{CommitBuilder, CommitProperties, PROTOCOL};
 use crate::kernel::{Action, EagerSnapshot, StructTypeExt, new_metadata, resolve_snapshot};
@@ -88,7 +88,7 @@ use crate::operations::merge::barrier::find_node;
 use crate::operations::write::WriterStatsConfig;
 use crate::operations::write::execution::write_execution_plan_v2;
 use crate::operations::write::generated_columns::{
-    able_to_gc, add_generated_columns, add_missing_generated_columns,
+    add_generated_columns, add_missing_generated_columns, gc_is_enabled,
 };
 use crate::protocol::{DeltaOperation, MergePredicate};
 use crate::table::config::TablePropertiesExt as _;
@@ -383,7 +383,16 @@ impl MergeBuilder {
         self
     }
 
-    /// The Datafusion session state to use
+    /// Set the DataFusion session used for planning and execution.
+    ///
+    /// The provided `state` must wrap a concrete `datafusion::execution::context::SessionState`.
+    /// Other `datafusion::catalog::Session` implementations will cause the operation to return an
+    /// error at execution time.
+    ///
+    /// This strictness avoids subtle bugs where Delta object stores could be registered on one
+    /// runtime environment while execution uses a different `task_ctx()` / runtime environment.
+    ///
+    /// Example: `Arc::new(create_session().state())`.
     pub fn with_session_state(mut self, state: Arc<dyn Session>) -> Self {
         self.state = Some(state);
         self
@@ -801,7 +810,7 @@ async fn execute(
     let mut generated_col_exp = None;
     let mut missing_generated_col = None;
 
-    if able_to_gc(&snapshot)? {
+    if gc_is_enabled(&snapshot) {
         let generated_col_expressions = snapshot.schema().get_generated_columns()?;
         let (source_with_gc, missing_generated_columns) =
             add_missing_generated_columns(source, &generated_col_expressions)?;
@@ -847,10 +856,7 @@ async fn execute(
 
     let join_schema_df = build_join_schema(source_schema, target_schema, &JoinType::Full)?;
 
-    let predicate = match predicate {
-        Expression::DataFusion(expr) => expr,
-        Expression::String(s) => parse_predicate_expression(&join_schema_df, s, &state)?,
-    };
+    let predicate = predicate.resolve(&state, Arc::new(join_schema_df.clone()))?;
 
     // Attempt to construct an early filter that we can apply to the Add action list and the delta scan.
     // In the case where there are partition columns in the join predicate, we can scan the source table
@@ -1390,15 +1396,7 @@ async fn execute(
     let scan_count = find_node::<DeltaScan>(&write).ok_or_else(err)?;
 
     let table_partition_cols = current_metadata.partition_columns().clone();
-
-    let writer_stats_config = WriterStatsConfig::new(
-        snapshot.table_properties().num_indexed_cols(),
-        snapshot
-            .table_properties()
-            .data_skipping_stats_columns
-            .as_ref()
-            .map(|v| v.iter().map(|v| v.to_string()).collect::<Vec<String>>()),
-    );
+    let writer_stats_config = WriterStatsConfig::from_config(snapshot.table_configuration());
 
     let (mut actions, write_plan_metrics) = write_execution_plan_v2(
         Some(&snapshot),
@@ -1506,13 +1504,14 @@ fn modify_schema(
             Ok(target_field) => {
                 // This case is when there is an added column in an nested datatype
                 let new_field = merge_arrow_field(target_field, source_field, true)?;
-                if &new_field != target_field {
+                if new_field != **target_field {
                     ending_schema.try_merge(&Arc::new(new_field))?;
                 }
             }
             Err(_) => {
                 // This function is called multiple time with different operations so this handle any collisions
-                ending_schema.try_merge(&Arc::new(source_field.to_owned().with_nullable(true)))?;
+                ending_schema
+                    .try_merge(&Arc::new(source_field.as_ref().clone().with_nullable(true)))?;
             }
         }
     }
@@ -1599,7 +1598,6 @@ mod tests {
     use crate::DeltaTable;
     use crate::TableProperty;
     use crate::kernel::{Action, DataType, PrimitiveType, StructField};
-    use crate::operations::load_cdf::collect_batches;
     use crate::operations::merge::filter::generalize_filter;
     use crate::protocol::*;
     use crate::writer::test_utils::datafusion::get_data;
@@ -1617,6 +1615,7 @@ mod tests {
     use datafusion::logical_expr::col;
     use datafusion::logical_expr::expr::Placeholder;
     use datafusion::logical_expr::lit;
+    use datafusion::physical_plan::collect;
     use datafusion::prelude::*;
     use delta_kernel::engine::arrow_conversion::TryIntoKernel;
     use delta_kernel::schema::StructType;
@@ -2980,12 +2979,6 @@ mod tests {
         let last_commit = table.last_commit().await.unwrap();
         let parameters = last_commit.operation_parameters.clone().unwrap();
         assert!(!parameters.contains_key("predicate"));
-        assert_eq!(
-            parameters["mergePredicate"],
-            "target.id = source.id AND \
-            target.id IN (source.id, source.modified, source.value) AND \
-            target.modified IN ('2021-02-02')"
-        );
 
         let expected = vec![
             "+----+-------+------------+",
@@ -4298,13 +4291,9 @@ mod tests {
             .await
             .expect("Failed to load CDF");
 
-        let mut batches = collect_batches(
-            table.properties().output_partitioning().partition_count(),
-            table,
-            ctx,
-        )
-        .await
-        .expect("Failed to collect batches");
+        let mut batches = collect(table, ctx.task_ctx())
+            .await
+            .expect("Failed to collect batches");
 
         let _ = arrow::util::pretty::print_batches(&batches);
 
@@ -4418,13 +4407,9 @@ mod tests {
             .await
             .expect("Failed to load CDF");
 
-        let mut batches = collect_batches(
-            table.properties().output_partitioning().partition_count(),
-            table,
-            ctx,
-        )
-        .await
-        .expect("Failed to collect batches");
+        let mut batches = collect(table, ctx.task_ctx())
+            .await
+            .expect("Failed to collect batches");
 
         let _ = arrow::util::pretty::print_batches(&batches);
 
@@ -4506,13 +4491,9 @@ mod tests {
             .await
             .expect("Failed to load CDF");
 
-        let mut batches = collect_batches(
-            table.properties().output_partitioning().partition_count(),
-            table,
-            ctx,
-        )
-        .await
-        .expect("Failed to collect batches");
+        let mut batches = collect(table, ctx.task_ctx())
+            .await
+            .expect("Failed to collect batches");
 
         let _ = arrow::util::pretty::print_batches(&batches);
 

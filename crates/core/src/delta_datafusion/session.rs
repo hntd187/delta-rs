@@ -1,8 +1,6 @@
 use std::sync::Arc;
 
 use datafusion::{
-    catalog::Session,
-    common::{Result as DataFusionResult, exec_datafusion_err},
     execution::{
         SessionState, SessionStateBuilder,
         disk_manager::DiskManagerBuilder,
@@ -17,19 +15,6 @@ use crate::delta_datafusion::planner::DeltaPlanner;
 
 pub fn create_session() -> DeltaSessionContext {
     DeltaSessionContext::default()
-}
-
-// Given a `Session` reference, get the concrete `SessionState` reference
-// Note: this may stop working in future versions,
-#[deprecated(
-    since = "0.29.1",
-    note = "Stop gap to get rid of all explicit session state references"
-)]
-pub(crate) fn session_state_from_session(session: &dyn Session) -> DataFusionResult<&SessionState> {
-    session
-        .as_any()
-        .downcast_ref::<SessionState>()
-        .ok_or_else(|| exec_datafusion_err!("Failed to downcast Session to SessionState"))
 }
 
 /// A wrapper for sql_parser's ParserOptions to capture sane default table defaults
@@ -63,7 +48,16 @@ impl Default for DeltaSessionConfig {
     fn default() -> Self {
         DeltaSessionConfig {
             inner: SessionConfig::default()
-                .set_bool("datafusion.sql_parser.enable_ident_normalization", false),
+                .set_bool("datafusion.sql_parser.enable_ident_normalization", false)
+                .set_bool("datafusion.execution.parquet.schema_force_view_types", true)
+                // Workaround: hash-join dynamic filtering (IN-list pushdown) can panic when join
+                // keys include dictionary arrays (still reproducible with DF 52.1.x crates).
+                // Disable IN-list pushdown and fall back to hash lookups.
+                .set_usize("datafusion.optimizer.hash_join_inlist_pushdown_max_size", 0)
+                .set_usize(
+                    "datafusion.optimizer.hash_join_inlist_pushdown_max_distinct_values",
+                    0,
+                ),
         }
     }
 }

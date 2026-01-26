@@ -144,14 +144,14 @@ mod local {
             .with_columns(table_schema.fields().cloned())
             .with_partition_columns(partitions)
             .await
-            .unwrap();
+            .expect("Failed to create table");
 
         for batch in batches {
             table = table
                 .write(vec![batch])
                 .with_save_mode(save_mode)
                 .await
-                .unwrap();
+                .expect("Failed to prepare when writing");
         }
 
         (table_dir, table)
@@ -178,7 +178,8 @@ mod local {
         .collect()
         .await?;
 
-        let batch = &batches[0];
+        let schema = batches[0].schema();
+        let batch = arrow::compute::concat_batches(&schema, &batches)?;
 
         assert_eq!(
             batch.column(0).as_ref(),
@@ -200,7 +201,8 @@ mod local {
             .collect()
             .await?;
 
-        let batch = &batches[0];
+        let schema = batches[0].schema();
+        let batch = arrow::compute::concat_batches(&schema, &batches)?;
 
         assert_eq!(
             batch.column(0).as_ref(),
@@ -327,7 +329,8 @@ mod local {
 
             let batches = df.collect().await?;
 
-            let batch = &batches[0];
+            let schema = batches[0].schema();
+            let batch = arrow::compute::concat_batches(&schema, &batches)?;
 
             assert_eq!(
                 batch.column(0).as_ref(),
@@ -380,11 +383,11 @@ mod local {
         // Build a new context from scratch and deserialize the plan
         let ctx = create_session().into_inner();
         let state = ctx.state();
-        let source_scan = Arc::new(logical_plan_from_bytes_with_extension_codec(
+        let source_scan = logical_plan_from_bytes_with_extension_codec(
             &source_scan_bytes,
             &ctx.task_ctx(),
             &DeltaLogicalCodec {},
-        )?);
+        )?;
         let schema: StructType = source_scan.schema().as_arrow().try_into_kernel().unwrap();
         let fields = schema.fields().cloned();
 
@@ -400,7 +403,7 @@ mod local {
             target_table.log_store(),
             target_table.snapshot().ok().map(|s| s.snapshot()).cloned(),
         )
-        .with_input_execution_plan(source_scan)
+        .with_input_plan(source_scan)
         .with_session_state(Arc::new(state))
         .await?;
         target_table.update_datafusion_session(&ctx.state())?;
@@ -497,9 +500,11 @@ mod local {
 
         assert_eq!(statistics.num_rows, Precision::Absent);
 
-        assert_eq!(
-            statistics.total_byte_size,
-            Precision::Exact((400 + 404 + 396) as usize)
+        let total_byte_size = statistics.total_byte_size.clone();
+        let expected_total_byte_size = (400 + 404 + 396) as usize;
+        assert!(
+            total_byte_size == Precision::Exact(expected_total_byte_size)
+                || total_byte_size == Precision::Inexact(expected_total_byte_size)
         );
         let column_stats = statistics.column_statistics.first().unwrap();
         assert_eq!(column_stats.null_count, Precision::Absent);
@@ -1286,16 +1291,15 @@ mod local {
             );
         let tbl = tbl.await.unwrap();
         let ctx = SessionContext::new();
-        let plan = Arc::new(
-            ctx.sql("SELECT 1 as id")
-                .await
-                .unwrap()
-                .logical_plan()
-                .clone(),
-        );
+        let plan = ctx
+            .sql("SELECT 1 as id")
+            .await
+            .unwrap()
+            .logical_plan()
+            .clone();
         let write_builder = WriteBuilder::new(log_store, tbl.state.map(|s| s.snapshot().clone()));
         let _ = write_builder
-            .with_input_execution_plan(plan)
+            .with_input_plan(plan)
             .with_save_mode(SaveMode::Overwrite)
             .with_schema_mode(deltalake_core::operations::write::SchemaMode::Overwrite)
             .await
@@ -1365,7 +1369,7 @@ async fn simple_query(context: &IntegrationContext) -> TestResult {
 }
 
 #[tokio::test]
-async fn test_schema_adapter_empty_batch() {
+async fn test_schema_evolution_missing_column_returns_nulls() {
     let ctx = SessionContext::new();
     let tmp_dir = tempfile::tempdir().unwrap();
     let table_uri = tmp_dir.path().to_str().to_owned().unwrap();

@@ -23,6 +23,7 @@ use deltalake::datafusion::catalog::TableProvider;
 use deltalake::datafusion::datasource::provider_as_source;
 use deltalake::datafusion::logical_expr::LogicalPlanBuilder;
 use deltalake::datafusion::prelude::SessionContext;
+use deltalake::delta_datafusion::engine::AsObjectStoreUrl;
 use deltalake::delta_datafusion::{DeltaCdfTableProvider, DeltaScanConfig, DeltaScanNext};
 
 use deltalake::errors::DeltaTableError;
@@ -34,12 +35,12 @@ use deltalake::kernel::{
 use deltalake::lakefs::LakeFSCustomExecuteHandler;
 use deltalake::logstore::LogStoreRef;
 use deltalake::logstore::{IORuntime, ObjectStoreRef};
+use deltalake::operations::CustomExecuteHandler;
 use deltalake::operations::convert_to_delta::{ConvertToDeltaBuilder, PartitionStrategy};
-use deltalake::operations::optimize::{create_session_state_for_optimize, OptimizeType};
+use deltalake::operations::optimize::{OptimizeType, create_session_state_for_optimize};
 use deltalake::operations::update_table_metadata::TableMetadataUpdate;
 use deltalake::operations::vacuum::VacuumMode;
 use deltalake::operations::write::WriteBuilder;
-use deltalake::operations::CustomExecuteHandler;
 use deltalake::parquet::basic::{Compression, Encoding};
 use deltalake::parquet::errors::ParquetError;
 use deltalake::parquet::file::properties::{EnabledStatistics, WriterProperties};
@@ -47,12 +48,12 @@ use deltalake::partitions::PartitionFilter;
 use deltalake::protocol::{DeltaOperation, SaveMode};
 use deltalake::table::config::TablePropertiesExt as _;
 use deltalake::table::state::DeltaTableState;
-use deltalake::{init_client_version, DeltaResult, DeltaTable, DeltaTableBuilder};
+use deltalake::{DeltaResult, DeltaTable, DeltaTableBuilder, init_client_version};
 use futures::TryStreamExt;
 use pyo3::exceptions::{PyRuntimeError, PyValueError};
 use pyo3::pybacked::PyBackedStr;
 use pyo3::types::{PyCapsule, PyDict, PyFrozenSet};
-use pyo3::{prelude::*, IntoPyObjectExt};
+use pyo3::{IntoPyObjectExt, prelude::*};
 use pyo3_arrow::export::{Arro3RecordBatch, Arro3RecordBatchReader};
 use pyo3_arrow::{PyRecordBatchReader, PySchema as PyArrowSchema};
 use schema::PySchema;
@@ -69,13 +70,13 @@ use uuid::Uuid;
 use writer::maybe_lazy_cast_reader;
 
 use crate::datafusion::TokioDeltaScan;
-use crate::error::{to_rt_err, DeltaError, DeltaProtocolError, PythonError};
+use crate::error::{DeltaError, DeltaProtocolError, PythonError, to_rt_err};
 use crate::features::TableFeatures;
 use crate::filesystem::FsConfig;
 use crate::merge::PyMergeBuilder;
 use crate::query::PyQueryBuilder;
 use crate::reader::convert_stream_to_reader;
-use crate::schema::{schema_to_pyobject, Field};
+use crate::schema::{Field, schema_to_pyobject};
 use crate::utils::rt;
 use crate::writer::to_lazy_table;
 
@@ -1778,7 +1779,7 @@ impl RawDeltaTable {
                 .build()
                 .map_err(PythonError::from)?;
 
-            builder = builder.with_input_execution_plan(Arc::new(plan));
+            builder = builder.with_input_plan(plan);
 
             if let Some(schema_mode) = schema_mode {
                 builder = builder.with_schema_mode(schema_mode.parse().map_err(PythonError::from)?);
@@ -1841,6 +1842,10 @@ impl RawDeltaTable {
         let name = CString::new("datafusion_table_provider").unwrap();
         let table = self.with_table(|t| Ok(t.clone()))?;
 
+        let log_store = table.log_store();
+        let object_store_url = log_store.root_url().as_object_store_url();
+        let object_store = log_store.root_object_store(None);
+
         let config = DeltaScanConfig::new().with_wrap_partition_values(false);
         let snapshot = table
             .snapshot()
@@ -1848,9 +1853,20 @@ impl RawDeltaTable {
             .snapshot()
             .clone();
         let scan = DeltaScanNext::new(snapshot, config).map_err(PythonError::from)?;
-        let tokio_scan =
-            Arc::new(TokioDeltaScan::new(scan, handle.clone())) as Arc<dyn TableProvider>;
-        let provider = FFI_TableProvider::new(tokio_scan, false, Some(handle.clone()));
+        let tokio_scan = Arc::new(
+            TokioDeltaScan::new(scan, handle.clone())
+                .with_object_store(object_store_url, object_store),
+        ) as Arc<dyn TableProvider>;
+        let ctx =
+            Arc::new(SessionContext::new()) as Arc<dyn datafusion_execution::TaskContextProvider>;
+        let task_ctx_provider = datafusion_ffi::execution::FFI_TaskContextProvider::from(&ctx);
+        let provider = FFI_TableProvider::new(
+            tokio_scan,
+            false,
+            Some(handle.clone()),
+            task_ctx_provider,
+            None,
+        );
 
         PyCapsule::new(py, provider, Some(name.clone()))
     }

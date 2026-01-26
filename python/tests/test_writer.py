@@ -178,9 +178,7 @@ def test_merge_schema(existing_table: DeltaTable):
     read_data = existing_table.to_pyarrow_table().sort_by(
         [("utf8", "ascending"), ("new_x", "ascending")]
     )
-    print(repr(read_data.to_pylist()))
     concated = pa.concat_tables([old_table_data, new_data])
-    print(repr(concated.to_pylist()))
     assert read_data == concated
 
     write_deltalake(existing_table, new_data, mode="overwrite", schema_mode="overwrite")
@@ -550,9 +548,7 @@ def test_roundtrip_null_partition(
         ChunkedArray(
             Array(
                 ["a", "a", "a", "a", None],
-                type=ArrowField(
-                    "utf8_with_nulls", DataType.string_view(), nullable=True
-                ),
+                type=ArrowField("utf8_with_nulls", DataType.string(), nullable=True),
             )
         ),
     )
@@ -1368,7 +1364,7 @@ def test_partition_overwrite_with_new_partition(
         {
             "p1": Array(
                 ["1", "1", "2", "2"],
-                ArrowField("p1", type=DataType.string_view(), nullable=False),
+                ArrowField("p1", type=DataType.string(), nullable=False),
             ),
             "p2": Array(
                 [1, 2, 1, 2],
@@ -1710,7 +1706,7 @@ def test_schema_cols_diff_order(tmp_path: pathlib.Path):
         {
             "foo": Array(
                 ["B"] * 10,
-                ArrowField("foo", type=DataType.string_view(), nullable=True),
+                ArrowField("foo", type=DataType.string(), nullable=True),
             ),
             "bar": Array(
                 [1] * 10,
@@ -2042,7 +2038,6 @@ def test_roundtrip_cdc_evolution(tmp_path: pathlib.Path):
     delta_table.update(predicate="utf8 = '1'", updates={"utf8": "'hello world'"})
 
     delta_table = DeltaTable(tmp_path)
-    print(os.listdir(tmp_path))
     # This is kind of a weak test to verify that CDFs were written
     assert os.path.isdir(os.path.join(tmp_path, "_change_data"))
 
@@ -2647,3 +2642,39 @@ def test_url_encoding_timestamp(tmp_path):
     write_deltalake(
         table_or_uri=tmp_path, data=data, mode="overwrite", predicate="value >= 10"
     )
+
+
+def test_write_table_with_deletion_vectors(tmp_path: pathlib.Path):
+    """
+    Tables with deletion vectors should still be writeable even without writing deletion vectors directly
+    """
+    schema = Schema(
+        fields=[
+            Field("id", type=PrimitiveType("string"), nullable=True),
+            Field("price", type=PrimitiveType("long"), nullable=True),
+        ]
+    )
+    dt = DeltaTable.create(
+        tmp_path,
+        schema,
+        name="test_name",
+        description="test_desc",
+        configuration={
+            "delta.enableDeletionVectors": "true",
+        },
+    )
+    assert dt.protocol().min_writer_version == 7
+    assert dt.version() == 0
+
+    data = Table.from_pydict(
+        {
+            "id": Array(["1 2"], DataType.string()),
+            "price": Array([10], DataType.int64()),
+        },
+        schema=schema,
+    )
+
+    write_deltalake(dt, data, mode="append")
+
+    dt = DeltaTable(tmp_path)
+    assert dt.version() == 1, "Expected a write to have occurred!"

@@ -180,7 +180,6 @@ def test_load_as_version_datetime_with_logs_removed(
 
     for file_name, dt_epoch in log_mtime_pairs:
         file_path = log_path / file_name
-        print(file_path)
         os.utime(file_path, (dt_epoch, dt_epoch))
 
     dt = DeltaTable(tmp_path, version=expected_version)
@@ -1127,11 +1126,11 @@ def test_read_query_builder_join_multiple_tables(tmp_path):
             {
                 "date": Array(
                     ["2021-01-01", "2021-01-02", "2021-01-03", "2021-12-31"],
-                    ArrowField("date", type=DataType.string_view(), nullable=True),
+                    ArrowField("date", type=DataType.string(), nullable=True),
                 ),
                 "value": Array(
                     ["a", "b", "c", "d"],
-                    ArrowField("value", type=DataType.string_view(), nullable=True),
+                    ArrowField("value", type=DataType.string(), nullable=True),
                 ),
             }
         ),
@@ -1169,3 +1168,11 @@ def test_read_query_builder_join_multiple_tables(tmp_path):
         .read_all()
     )
     assert expected == actual
+
+
+def test_read_deletion_vectors():
+    table_path = "../crates/test/tests/data/table-with-dv-small"
+    dt = DeltaTable(table_path)
+    assert QueryBuilder().register("tbl", dt).execute("select * from tbl").read_all()[
+        "value"
+    ].to_pylist() == [1, 2, 3, 4, 5, 6, 7, 8]

@@ -19,12 +19,12 @@ use arrow::datatypes::{Schema, SchemaRef};
 use arrow_schema::{DataType, Field, FieldRef, SchemaBuilder};
 use datafusion::common::error::Result;
 use datafusion::common::tree_node::{Transformed, TreeNode};
-use datafusion::common::{HashMap, HashSet, plan_err};
+use datafusion::common::{HashMap, HashSet, exec_err, plan_err};
 use datafusion::logical_expr::TableProviderFilterPushDown;
 use datafusion::logical_expr::utils::conjunction;
 use datafusion::prelude::Expr;
 use datafusion_datasource::file_scan_config::wrap_partition_type_in_dict;
-use delta_kernel::engine::arrow_conversion::{TryIntoArrow, TryIntoKernel as _};
+use delta_kernel::engine::arrow_conversion::{TryIntoArrow as _, TryIntoKernel as _};
 use delta_kernel::schema::DataType as KernelDataType;
 use delta_kernel::table_configuration::TableConfiguration;
 use delta_kernel::table_features::TableFeature;
@@ -32,7 +32,9 @@ use delta_kernel::{Expression, Predicate, PredicateRef};
 use itertools::Itertools;
 
 use crate::delta_datafusion::DeltaScanConfig;
-use crate::delta_datafusion::engine::{to_datafusion_expr, to_delta_expression, to_predicate};
+use crate::delta_datafusion::engine::{
+    to_datafusion_expr, to_delta_expression, to_delta_predicate,
+};
 use crate::delta_datafusion::table_provider::next::FILE_ID_COLUMN_DEFAULT;
 use crate::kernel::{Scan, Snapshot};
 
@@ -47,7 +49,7 @@ use crate::kernel::{Scan, Snapshot};
 /// Manages three schemas:
 /// - **result_schema**: Logical schema exposed to query after all transformations
 /// - **output_schema**: Final schema including metadata columns (e.g., file_id)
-/// - **parquet_read_schema**: Physical schema for reading Parquet files
+/// - **parquet_read_schema**: Physical schema for Parquet reads + predicate evaluation
 ///
 /// # Predicate Pushdown
 ///
@@ -65,10 +67,16 @@ pub(crate) struct KernelScanPlan {
     /// If set, indicates a projection to apply to the
     /// scan output to obtain the result schema
     pub(crate) result_projection: Option<Vec<usize>>,
-    /// The schema the inner Parquet scan should read from data files.
+    /// Physical schema used for Parquet reads and predicate evaluation.
     pub(crate) parquet_read_schema: SchemaRef,
     /// If set, indicates a predicate to apply at the Parquet scan level
     pub(crate) parquet_predicate: Option<Expr>,
+    /// Predicate passed to delta kernel for file skipping,
+    ///
+    /// If this is configured, the predicates pushed into the scan will
+    /// not be considered for file skipping. This is to handle file re-write
+    /// cases in UPDATE, MERGE, etc.
+    pub(crate) skipping_predicate: Option<PredicateRef>,
 }
 
 impl KernelScanPlan {
@@ -77,18 +85,40 @@ impl KernelScanPlan {
         projection: Option<&Vec<usize>>,
         filters: &[Expr],
         config: &DeltaScanConfig,
+        skipping_predicate: Option<Vec<Expr>>,
     ) -> Result<Self> {
         let table_config = snapshot.table_configuration();
         let table_schema = config.table_schema(table_config)?;
 
         // At this point we should only have supported predicates, but we decide where
         // when can handle them (kernel scan and/or parquet scan)
-        let (kernel_predicate, parquet_predicate) = process_filters(filters, table_config)?;
-        let scan_builder = snapshot.scan_builder().with_predicate(kernel_predicate);
+        let (kernel_predicate, parquet_predicate) = process_filters(filters, table_config, config)?;
+
+        // if some dedicated file skipping predicate is supplied,
+        // we do not push the scan filters into the kernel scan.
+        let scan_predicate = if let Some(sp) = skipping_predicate {
+            let (Some(pred), _) = process_filters(&sp, table_config, config)? else {
+                return exec_err!("Failed to convert file skipping perdicate to kernel.");
+            };
+            Some(pred)
+        } else {
+            kernel_predicate
+        };
+
+        let scan_builder = snapshot
+            .scan_builder()
+            .with_predicate(scan_predicate.clone());
 
         let Some(projection) = projection else {
             let scan = Arc::new(scan_builder.build()?);
-            return Self::try_new_with_scan(scan, config, table_schema, None, parquet_predicate);
+            return Self::try_new_with_scan(
+                scan,
+                config,
+                table_schema,
+                None,
+                parquet_predicate,
+                scan_predicate,
+            );
         };
 
         // The table projection may not include all columns referenced in filters,
@@ -110,8 +140,14 @@ impl KernelScanPlan {
             .cloned()
             .collect();
 
+        let file_id_field = config.file_id_field();
         let mut projection = projection.clone();
         for col in missing_columns {
+            // the file id field is not part of the table schema here, as
+            // it is managed on the table provider level.
+            if col == file_id_field.name() {
+                continue;
+            }
             projection.push(table_schema.index_of(col)?);
         }
 
@@ -148,6 +184,7 @@ impl KernelScanPlan {
             result_schema,
             result_projection,
             parquet_predicate,
+            scan_predicate,
         )
     }
 
@@ -157,6 +194,7 @@ impl KernelScanPlan {
         result_schema: SchemaRef,
         result_projection: Option<Vec<usize>>,
         parquet_predicate: Option<Expr>,
+        skipping_predicate: Option<PredicateRef>,
     ) -> Result<Self> {
         let output_schema = if config.retain_file_id() {
             let mut schema_builder = SchemaBuilder::from(result_schema.as_ref());
@@ -165,10 +203,8 @@ impl KernelScanPlan {
         } else {
             result_schema.clone()
         };
-        let parquet_read_schema = config.physical_arrow_schema(
-            scan.snapshot().table_configuration(),
-            &scan.physical_schema().as_ref().try_into_arrow()?,
-        )?;
+        let parquet_read_schema =
+            config.parquet_file_schema(&scan.physical_schema().as_ref().try_into_arrow()?)?;
         Ok(Self {
             scan,
             result_schema,
@@ -176,6 +212,7 @@ impl KernelScanPlan {
             result_projection,
             parquet_read_schema,
             parquet_predicate,
+            skipping_predicate,
         })
     }
 
@@ -194,6 +231,8 @@ impl KernelScanPlan {
 
 impl DeltaScanConfig {
     pub(crate) fn file_id_field(&self) -> FieldRef {
+        // NOTE: keep the synthetic file-id column as Dictionary<UInt16, Utf8>.
+        // Arrow's dictionary packing does not support Utf8View, and this column is internal.
         Arc::new(Field::new(
             self.file_column_name
                 .as_deref()
@@ -234,6 +273,61 @@ impl DeltaScanConfig {
                 .collect_vec(),
         ));
         Ok(table_schema)
+    }
+
+    fn parquet_file_schema(&self, base: &Schema) -> Result<SchemaRef> {
+        // IMPORTANT: This schema is used for Parquet reading and predicate evaluation.
+        //
+        // DataFusion can materialize `Utf8View/BinaryView` when requested, but predicate
+        // pushdown is evaluated against the physical file schema before schema-rewriter casts
+        // are applied, and those coercions are not consistently propagated through nested field
+        // accesses nor to literals. This can produce mismatches during evaluation such as:
+        // `Invalid comparison operation: Utf8 == Utf8View`.
+        //
+        // To keep pushdown stable, we request base `Utf8/Binary` here and only expose view
+        // types at the DeltaScan boundary (see `map_field`).
+        //
+        // NOTE: This Parquet read schema is intentionally not the same as the table provider
+        // output schema. The output schema may force view types (Utf8View/BinaryView) and other
+        // presentation-level physical types, but Parquet read + predicate pushdown must operate
+        // on the file's base types.
+        let table_schema = Arc::new(Schema::new(
+            base.fields()
+                .iter()
+                .map(|f| self.map_field_for_parquet(f.clone()))
+                .collect_vec(),
+        ));
+        Ok(table_schema)
+    }
+
+    fn map_field_for_parquet(&self, field: FieldRef) -> FieldRef {
+        let dt = match field.data_type() {
+            DataType::Struct(fields) => DataType::Struct(
+                fields
+                    .iter()
+                    .map(|f| self.map_field_for_parquet(f.clone()))
+                    .collect(),
+            ),
+            DataType::List(inner) => DataType::List(self.map_field_for_parquet(inner.clone())),
+            DataType::LargeList(inner) => {
+                DataType::LargeList(self.map_field_for_parquet(inner.clone()))
+            }
+            DataType::ListView(inner) => {
+                DataType::ListView(self.map_field_for_parquet(inner.clone()))
+            }
+            // Always use base types for the Parquet read schema.
+            DataType::Utf8View => DataType::Utf8,
+            DataType::BinaryView => DataType::Binary,
+            _ => field.data_type().clone(),
+        };
+
+        let field = if &dt != field.data_type() {
+            Arc::new(field.as_ref().clone().with_data_type(dt))
+        } else {
+            field
+        };
+
+        field
     }
 
     fn map_field(&self, field: FieldRef, partition_cols: &[String]) -> FieldRef {
@@ -305,10 +399,22 @@ impl DeltaScanConfig {
 pub(crate) fn supports_filters_pushdown(
     filter: &[&Expr],
     config: &TableConfiguration,
+    scan_config: &DeltaScanConfig,
 ) -> Vec<TableProviderFilterPushDown> {
+    let file_id_field = scan_config
+        .file_column_name
+        .as_deref()
+        .unwrap_or(FILE_ID_COLUMN_DEFAULT);
+
+    // Parquet predicate pushdown is enabled only when we can safely apply it at read time.
+    // Deletion vectors require preserving row order for selection masks, and row tracking
+    // disables predicate pushdown in the read plan.
+    let parquet_pushdown_enabled = scan_config.enable_parquet_pushdown
+        && !config.is_feature_enabled(&TableFeature::RowTracking)
+        && !config.is_feature_enabled(&TableFeature::DeletionVectors);
     filter
         .iter()
-        .map(|f| process_predicate(f, config).pushdown)
+        .map(|f| process_predicate(f, config, file_id_field, parquet_pushdown_enabled).pushdown)
         .collect()
 }
 
@@ -324,10 +430,19 @@ pub(crate) fn supports_filters_pushdown(
 fn process_filters(
     filters: &[Expr],
     config: &TableConfiguration,
+    scan_config: &DeltaScanConfig,
 ) -> Result<(Option<PredicateRef>, Option<Expr>)> {
+    let file_id_field = scan_config
+        .file_column_name
+        .as_deref()
+        .unwrap_or(FILE_ID_COLUMN_DEFAULT);
+
+    let parquet_pushdown_enabled = scan_config.enable_parquet_pushdown
+        && !config.is_feature_enabled(&TableFeature::RowTracking)
+        && !config.is_feature_enabled(&TableFeature::DeletionVectors);
     let (parquet, kernel): (Vec<_>, Vec<_>) = filters
         .iter()
-        .map(|f| process_predicate(f, config))
+        .map(|f| process_predicate(f, config, file_id_field, parquet_pushdown_enabled))
         .map(|p| (p.parquet_predicate, p.kernel_predicate))
         .unzip();
     let parquet = if config.is_feature_enabled(&TableFeature::ColumnMapping) {
@@ -350,18 +465,28 @@ struct ProcessedPredicate<'a> {
     pub parquet_predicate: Option<&'a Expr>,
 }
 
-fn process_predicate<'a>(expr: &'a Expr, config: &TableConfiguration) -> ProcessedPredicate<'a> {
+fn process_predicate<'a>(
+    expr: &'a Expr,
+    config: &TableConfiguration,
+    file_id_column: &str,
+    parquet_pushdown_enabled: bool,
+) -> ProcessedPredicate<'a> {
     let cols = config.metadata().partition_columns();
     let only_partition_refs = expr.column_refs().iter().all(|c| cols.contains(&c.name));
     let any_partition_refs =
         only_partition_refs || expr.column_refs().iter().any(|c| cols.contains(&c.name));
+    let has_file_id = expr.column_refs().iter().any(|c| file_id_column == &c.name);
 
     // TODO(roeap): we may allow pusing predicates referencing partition columns
     // into the parquet scan, if the table has materialized partition columns
     let _has_partition_data = config.is_feature_enabled(&TableFeature::MaterializePartitionColumns);
 
     // Try to convert the expression into a kernel predicate
-    if let Ok(kernel_predicate) = to_predicate(expr) {
+    if let Ok(kernel_predicate) = to_delta_predicate(expr)
+        // delta kernel is unaware of the file id field, so it cannot process
+        // predicates that reference it.
+        && !has_file_id
+    {
         let (pushdown, parquet_predicate) = if only_partition_refs {
             // All references are to partition columns so the kernel
             // scan can fully handle the predicate and return exact results
@@ -373,7 +498,13 @@ fn process_predicate<'a>(expr: &'a Expr, config: &TableConfiguration) -> Process
             // push down any predicate to parquet
             (TableProviderFilterPushDown::Inexact, None)
         } else {
-            (TableProviderFilterPushDown::Inexact, Some(expr))
+            // For non-partition predicates we can *attempt* Parquet pushdown, but it is not a
+            // correctness boundary (it may be partially applied or skipped). Keep this Inexact so
+            // DataFusion retains a post-scan Filter.
+            (
+                TableProviderFilterPushDown::Inexact,
+                parquet_pushdown_enabled.then_some(expr),
+            )
         };
         return ProcessedPredicate {
             pushdown,
@@ -395,7 +526,7 @@ fn process_predicate<'a>(expr: &'a Expr, config: &TableConfiguration) -> Process
     ProcessedPredicate {
         pushdown: TableProviderFilterPushDown::Inexact,
         kernel_predicate: None,
-        parquet_predicate: Some(expr),
+        parquet_predicate: parquet_pushdown_enabled.then_some(expr),
     }
 }
 
@@ -449,6 +580,29 @@ mod tests {
 
     use super::*;
 
+    fn schema_has_view_types(schema: &Schema) -> bool {
+        schema
+            .fields()
+            .iter()
+            .any(|f| data_type_has_view_types(f.data_type()))
+    }
+
+    fn data_type_has_view_types(dt: &DataType) -> bool {
+        match dt {
+            DataType::Utf8View | DataType::BinaryView => true,
+            DataType::Dictionary(_, value) => data_type_has_view_types(value.as_ref()),
+            DataType::Map(entry, _) => data_type_has_view_types(entry.data_type()),
+            DataType::Struct(fields) => fields
+                .iter()
+                .any(|f| data_type_has_view_types(f.data_type())),
+            DataType::List(inner)
+            | DataType::LargeList(inner)
+            | DataType::ListView(inner)
+            | DataType::FixedSizeList(inner, _) => data_type_has_view_types(inner.data_type()),
+            _ => false,
+        }
+    }
+
     #[tokio::test]
     async fn test_rewrite_expression() -> TestResult {
         let mut table = open_fs_path("../test/tests/data/table_with_column_mapping");
@@ -480,6 +634,7 @@ mod tests {
             None,
             &[expr.clone()],
             &DeltaScanConfig::default(),
+            None,
         )?;
         let expected_pq =
             col("col-3877fd94-0973-4941-ac6b-646849a1ff65").eq(lit("Anthony Johnson"));
@@ -491,6 +646,7 @@ mod tests {
             None,
             &[expr.clone()],
             &DeltaScanConfig::default(),
+            None,
         )?;
         assert!(scan_plan.parquet_predicate.is_none());
 
@@ -500,6 +656,7 @@ mod tests {
             None,
             &[expr.clone()],
             &DeltaScanConfig::default(),
+            None,
         )?;
         println!("Scan plan: {:?}", scan_plan.parquet_predicate);
 
@@ -563,6 +720,32 @@ mod tests {
             .await?;
         let batches = collect(scan, ctx.task_ctx()).await?;
         assert_batches_sorted_eq!(&expected, &batches);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_view_types_only_exposed_in_result_schema() -> TestResult {
+        let mut table = open_fs_path("../test/tests/data/table_with_column_mapping");
+        table.load().await?;
+
+        let snapshot = table.snapshot()?.snapshot().snapshot();
+
+        let mut config = DeltaScanConfig::default();
+        config.schema_force_view_types = true;
+        let scan_plan = KernelScanPlan::try_new(snapshot, None, &[], &config, None)?;
+        assert!(schema_has_view_types(scan_plan.result_schema.as_ref()));
+        assert!(!schema_has_view_types(
+            scan_plan.parquet_read_schema.as_ref()
+        ));
+
+        let mut config = DeltaScanConfig::default();
+        config.schema_force_view_types = false;
+        let scan_plan = KernelScanPlan::try_new(snapshot, None, &[], &config, None)?;
+        assert!(!schema_has_view_types(scan_plan.result_schema.as_ref()));
+        assert!(!schema_has_view_types(
+            scan_plan.parquet_read_schema.as_ref()
+        ));
 
         Ok(())
     }
