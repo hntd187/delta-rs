@@ -1,150 +1,64 @@
 use crate::ConnectResult;
-use crate::proto::create_delta_table::Column;
+use crate::proto::delta_command::CommandType as DeltaCommandType;
 use crate::proto::delta_relation::RelationType;
 use crate::proto::delta_table::{AccessType, Path};
 use crate::proto::spark::command::CommandType;
-use crate::proto::spark::data_type::Kind;
 use crate::proto::spark::plan::OpType;
 use crate::proto::spark::relation::RelType;
-use crate::proto::spark::{
-    Command, DataType, ExecutePlanRequest, Limit, Plan, Relation, data_type,
-};
+use crate::proto::spark::{Command, ExecutePlanRequest, Limit, LocalRelation, Plan, Relation};
 use crate::proto::{
     DeltaCommand, DeltaRelation, DeltaTable, DescribeDetail, DescribeHistory, Scan,
 };
-use delta_kernel::schema::DataType as KernelDataType;
-use delta_kernel::schema::{ArrayType, MapType, PrimitiveType, StructField, StructType};
+use arrow::array::RecordBatch;
 use prost_types::Any;
+use std::collections::HashMap;
 
-impl Into<Column> for StructField {
-    fn into(self) -> Column {
-        Column {
-            name: self.name,
-            data_type: Some(self.data_type.into()),
-            nullable: self.nullable,
-            ..Default::default()
-        }
+fn record_batch_to_bytes(mut result: LocalRelation, batch: RecordBatch) -> ConnectResult<()> {
+    if let Some(data) = result.data.as_mut() {
+        let mut writer = arrow_ipc::writer::StreamWriter::try_new(data, batch.schema_ref())?;
+        writer.write(&batch)?;
+        writer.finish()?;
     }
-}
-
-impl Into<DataType> for KernelDataType {
-    fn into(self) -> DataType {
-        let kind = match self {
-            KernelDataType::Primitive(p) => match p {
-                PrimitiveType::String => Kind::String(data_type::String::default()),
-                PrimitiveType::Long => Kind::Long(data_type::Long::default()),
-                PrimitiveType::Integer => Kind::Integer(data_type::Integer::default()),
-                PrimitiveType::Short => Kind::Short(data_type::Short::default()),
-                PrimitiveType::Byte => Kind::Byte(data_type::Byte::default()),
-                PrimitiveType::Float => Kind::Float(data_type::Float::default()),
-                PrimitiveType::Double => Kind::Double(data_type::Double::default()),
-                PrimitiveType::Boolean => Kind::Boolean(data_type::Boolean::default()),
-                PrimitiveType::Binary => Kind::Binary(data_type::Binary::default()),
-                PrimitiveType::Date => Kind::Date(data_type::Date::default()),
-                PrimitiveType::Timestamp => Kind::Timestamp(data_type::Timestamp::default()),
-                PrimitiveType::TimestampNtz => {
-                    Kind::TimestampNtz(data_type::TimestampNtz::default())
-                }
-                PrimitiveType::Decimal(d) => Kind::Decimal(data_type::Decimal {
-                    precision: Some(d.precision() as i32),
-                    scale: Some(d.scale() as i32),
-                    ..Default::default()
-                }),
-            },
-            KernelDataType::Array(a) => Kind::Array(Box::new(a.into())),
-            KernelDataType::Struct(s) => Kind::Struct(s.into()),
-            KernelDataType::Map(m) => Kind::Map(Box::new(m.into())),
-            KernelDataType::Variant(v) => Kind::Variant(v.into()),
-        };
-        DataType { kind: Some(kind) }
-    }
-}
-
-impl Into<data_type::Map> for Box<MapType> {
-    fn into(self) -> data_type::Map {
-        data_type::Map {
-            key_type: Some(Box::new(self.key_type.into())),
-            value_type: Some(Box::new(self.value_type.into())),
-            value_contains_null: self.value_contains_null,
-            type_variation_reference: 0,
-        }
-    }
-}
-
-impl Into<data_type::Array> for Box<ArrayType> {
-    fn into(self) -> data_type::Array {
-        data_type::Array {
-            element_type: Some(Box::new(self.element_type.into())),
-            contains_null: self.contains_null,
-            type_variation_reference: 0,
-        }
-    }
-}
-
-impl Into<data_type::StructField> for StructField {
-    fn into(self) -> data_type::StructField {
-        data_type::StructField {
-            name: self.name,
-            data_type: Some(self.data_type.into()),
-            nullable: self.nullable,
-            metadata: None,
-        }
-    }
-}
-
-impl Into<data_type::Variant> for Box<StructType> {
-    fn into(self) -> data_type::Variant {
-        data_type::Variant {
-            type_variation_reference: 0,
-        }
-    }
-}
-impl Into<data_type::Struct> for Box<StructType> {
-    fn into(self) -> data_type::Struct {
-        data_type::Struct {
-            fields: self.fields().cloned().map(Into::into).collect(),
-            type_variation_reference: 0,
-        }
-    }
+    Ok(())
 }
 
 pub fn build_table(path: String) -> DeltaTable {
-    DeltaTable {
-        access_type: Some(AccessType::Path(Path {
-            path,
-            hadoop_conf: Default::default(),
-        })),
-    }
+    let path = Path::builder()
+        .path(path)
+        .hadoop_conf(HashMap::new())
+        .build();
+    DeltaTable::builder()
+        .access_type(AccessType::Path(path))
+        .build()
 }
 
 pub fn build_describe_history(table: DeltaTable) -> ConnectResult<DescribeHistory> {
-    Ok(DescribeHistory { table: Some(table) })
+    Ok(DescribeHistory::builder().table(table).build())
 }
 
 pub fn build_describe_detail(table: DeltaTable) -> ConnectResult<DescribeDetail> {
-    Ok(DescribeDetail { table: Some(table) })
+    Ok(DescribeDetail::builder().table(table).build())
 }
 
 pub fn build_delta_scan(table: DeltaTable) -> ConnectResult<Scan> {
-    Ok(Scan { table: Some(table) })
+    Ok(Scan::builder().table(table).build())
 }
 
 pub fn build_delta_relation(msg: RelationType) -> ConnectResult<DeltaRelation> {
-    Ok(DeltaRelation {
-        relation_type: Some(msg),
-    })
+    Ok(DeltaRelation::builder().relation_type(msg).build())
+}
+
+pub fn build_delta_command(msg: DeltaCommandType) -> ConnectResult<DeltaCommand> {
+    Ok(DeltaCommand::builder().command_type(msg).build())
 }
 
 pub fn with_limit(rel: Relation, limit: Option<i32>) -> OpType {
     if let Some(limit) = limit {
-        let limit = Limit {
-            input: Some(Box::new(rel)),
-            limit,
-        };
-        OpType::Root(Relation {
-            common: None,
-            rel_type: Some(RelType::Limit(Box::new(limit))),
-        })
+        let limit = Limit::builder().limit(limit).input(Box::new(rel)).build();
+        let new_relation = Relation::builder()
+            .rel_type(RelType::Limit(Box::new(limit)))
+            .build();
+        OpType::Root(new_relation)
     } else {
         OpType::Root(rel)
     }
@@ -155,33 +69,31 @@ pub fn build_spark_relation(
     delta_relation: DeltaRelation,
     limit: Option<i32>,
 ) -> ConnectResult<ExecutePlanRequest> {
-    let rel = Relation {
-        common: None,
-        rel_type: Some(RelType::Extension(Any::from_msg(&delta_relation)?)),
-    };
-    let rel_type = with_limit(rel, limit);
+    let rel_type = RelType::Extension(Any::from_msg(&delta_relation)?);
+    let rel = Relation::builder().rel_type(rel_type).build();
+    let op_type = with_limit(rel, limit);
 
-    let plan = Plan {
-        op_type: Some(rel_type),
-    };
-    Ok(ExecutePlanRequest {
-        session_id,
-        plan: Some(plan),
-        ..Default::default()
-    })
+    let plan = Plan::builder().op_type(op_type).build();
+    Ok(ExecutePlanRequest::builder()
+        .session_id(session_id)
+        .plan(plan)
+        .tags(vec![])
+        .request_options(vec![])
+        .build())
 }
 
-pub fn build_spark_command(delta_command: DeltaCommand) -> ConnectResult<ExecutePlanRequest> {
-    let cmd = Command {
-        command_type: Some(CommandType::Extension(Any::from_msg(&delta_command)?)),
-    };
-    let plan = Plan {
-        op_type: Some(OpType::Command(cmd)),
-    };
-    let id = uuid::Uuid::new_v4();
-    Ok(ExecutePlanRequest {
-        session_id: id.to_string(),
-        plan: Some(plan),
-        ..Default::default()
-    })
+pub fn build_spark_command(
+    session_id: String,
+    delta_command: DeltaCommand,
+) -> ConnectResult<ExecutePlanRequest> {
+    let cmd_type = CommandType::Extension(Any::from_msg(&delta_command)?);
+    let cmd = Command::builder().command_type(cmd_type).build();
+    let plan = Plan::builder().op_type(OpType::Command(cmd)).build();
+
+    Ok(ExecutePlanRequest::builder()
+        .session_id(session_id)
+        .plan(plan)
+        .tags(vec![])
+        .request_options(vec![])
+        .build())
 }

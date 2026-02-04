@@ -19,7 +19,7 @@ use syn::{
 /// Additional key aliases can be specified with the `#[delta(alias = "alias.name")]` attribute.
 /// Multiple aliases can be added by `#[delta(alias = "foo", alias = "bar")]`.
 ///
-/// Reading configuration can be achieved by assigning environmene keys to a field
+/// Reading configuration can be achieved by assigning environment keys to a field
 /// `#[delta(env = "MY_ENV_KEY")]`.
 #[proc_macro_derive(DeltaConfig, attributes(delta))]
 pub fn derive_delta_config(input: TokenStream) -> TokenStream {

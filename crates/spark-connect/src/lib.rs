@@ -1,4 +1,10 @@
+use crate::connect_error::ConnectError;
+use crate::proto::delta_command::CommandType;
 use crate::proto::spark::*;
+use crate::proto::{
+    AddFeatureSupport, CloneTable, CreateDeltaTable, DropFeatureSupport, Generate,
+    UpgradeTableProtocol, VacuumTable,
+};
 use arrow::array::RecordBatch;
 use arrow_ipc::reader::StreamReader;
 use bytes::Bytes;
@@ -21,10 +27,20 @@ pub mod proto {
 
 mod connect_error;
 mod proto_utils;
+mod schema;
 
-use crate::connect_error::ConnectError;
-use crate::proto::CreateDeltaTable;
 use proto_utils::*;
+
+macro_rules! generate_cmds {
+    ($(($name: ident, $tpe: ident)), *) => {
+        $(pub async fn $name(&mut self, arg: $tpe) -> ConnectResult<()> {
+            let cmd = build_delta_command(CommandType::$tpe(arg))?;
+            let request = build_spark_command(self.session_id.to_string(), cmd)?;
+            self.execute(request).await
+        }
+        )*
+    };
+}
 
 pub type ConnectResult<R> = Result<R, ConnectError>;
 
@@ -95,11 +111,15 @@ where
         Ok(std::mem::take(&mut self.response_handler.batches))
     }
 
-    pub async fn create_table(
-        &mut self,
-        create_delta_table: CreateDeltaTable,
-    ) -> ConnectResult<Vec<RecordBatch>> {
-    }
+    generate_cmds!(
+        (create_clone, CloneTable),
+        (create_vacuum, VacuumTable),
+        (upgrade_table_protocol, UpgradeTableProtocol),
+        (generate, Generate),
+        (create_table, CreateDeltaTable),
+        (add_feature_support, AddFeatureSupport),
+        (drop_feature_support, DropFeatureSupport)
+    );
 
     async fn execute(&mut self, plan: ExecutePlanRequest) -> ConnectResult<()> {
         let stream = self.session.execute_plan(plan).await?.into_inner();

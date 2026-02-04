@@ -27,6 +27,7 @@ arrow = { workspace = true, features = ["prettyprint", "chrono-tz"] }
 arrow-ipc = { workspace = true }
 uuid = { version = "1", features = ["v4"] }
 delta_kernel = "0.19"
+bon = "3"
 
 [dev-dependencies]
 tokio = "1"
