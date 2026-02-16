@@ -38,6 +38,7 @@ object_store = { workspace = true }
 # datafusion
 datafusion = { workspace = true, optional = true }
 datafusion-datasource = { workspace = true, optional = true }
+datafusion-physical-expr-adapter = { workspace = true, optional = true }
 datafusion-proto = { workspace = true, optional = true }
 
 # serde
@@ -109,6 +110,7 @@ default = ["rustls"]
 datafusion = [
     "dep:datafusion",
     "datafusion-datasource",
+    "datafusion-physical-expr-adapter",
     "datafusion-proto",
 ]
 datafusion-ext = ["datafusion"]
