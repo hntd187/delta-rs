@@ -1,7 +1,8 @@
 use crate::operations::create::CreateBuilder;
 use crate::protocol::SaveMode;
-use deltalake_spark_connect::proto::CreateDeltaTable;
+use deltalake_spark_connect::proto::{CreateDeltaTable, MergeIntoTable};
 use deltalake_spark_connect::proto::create_delta_table::Mode;
+use crate::operations::merge::MergeBuilder;
 
 trait IntoConnectPlan {
     fn into_connect_plan(self);
@@ -39,5 +40,12 @@ impl IntoConnectPlan for CreateBuilder {
             properties: Default::default(),
             clustering_columns: vec![],
         };
+    }
+}
+
+impl IntoConnectPlan for MergeBuilder {
+    fn into_connect_plan(self) {
+        
+        let merge = MergeIntoTable::builder().maybe_condition(self.predicate)
     }
 }

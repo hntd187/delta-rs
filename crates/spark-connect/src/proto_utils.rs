@@ -1,4 +1,5 @@
 use crate::ConnectResult;
+use crate::connect_error::ConnectError;
 use crate::proto::delta_command::CommandType as DeltaCommandType;
 use crate::proto::delta_relation::RelationType;
 use crate::proto::delta_table::{AccessType, Path};
@@ -30,6 +31,15 @@ pub fn build_table(path: String) -> DeltaTable {
     DeltaTable::builder()
         .access_type(AccessType::Path(path))
         .build()
+}
+
+impl TryInto<Relation> for DeltaRelation {
+    type Error = ConnectError;
+
+    fn try_into(self) -> ConnectResult<Relation> {
+        let rel_type = RelType::Extension(Any::from_msg(&self)?);
+        Ok(Relation::builder().rel_type(rel_type).build())
+    }
 }
 
 pub fn build_describe_history(table: DeltaTable) -> ConnectResult<DescribeHistory> {

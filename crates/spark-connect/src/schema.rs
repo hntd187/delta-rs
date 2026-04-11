@@ -1,6 +1,7 @@
 use crate::proto::create_delta_table::Column;
 use crate::proto::spark::data_type::Kind;
 use crate::proto::spark::{DataType, data_type};
+use delta_kernel::engine::arrow_conversion::TryIntoKernel;
 use delta_kernel::schema::DataType as KernelDataType;
 use delta_kernel::schema::{ArrayType, MapType, PrimitiveType, StructField, StructType};
 
@@ -93,5 +94,13 @@ impl Into<data_type::Struct> for Box<StructType> {
             fields: self.fields().cloned().map(Into::into).collect(),
             type_variation_reference: 0,
         }
+    }
+}
+
+impl Into<DataType> for arrow::datatypes::DataType {
+    fn into(self) -> DataType {
+        TryIntoKernel::<KernelDataType>::try_into_kernel(&self)
+            .unwrap()
+            .into()
     }
 }

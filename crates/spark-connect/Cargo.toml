@@ -26,8 +26,12 @@ http = "1"
 arrow = { workspace = true, features = ["prettyprint", "chrono-tz"] }
 arrow-ipc = { workspace = true }
 uuid = { version = "1", features = ["v4"] }
-delta_kernel = "0.19"
+delta_kernel = { version = "0.19", features = ["default-engine-rustls"] }
 bon = "3"
+datafusion-common = "52"
+datafusion-expr = "52"
+serde_json = "1"
+tracing = "0.1"
 
 [dev-dependencies]
 tokio = "1"

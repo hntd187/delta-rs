@@ -26,6 +26,7 @@ pub mod proto {
 }
 
 mod connect_error;
+mod expressions;
 mod proto_utils;
 mod schema;
 

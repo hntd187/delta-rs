@@ -123,38 +123,38 @@ const OUTPUT_COUNT_ID: &str = "merge_output_count";
 /// Merge records into a Delta Table.
 pub struct MergeBuilder {
     /// The join predicate
-    predicate: Expression,
+    pub(crate) predicate: Expression,
     /// Operations to perform when a source record and target record match
-    match_operations: Vec<MergeOperationConfig>,
+    pub(crate) match_operations: Vec<MergeOperationConfig>,
     /// Operations to perform on source records when they do not pair with a target record
-    not_match_operations: Vec<MergeOperationConfig>,
+    pub(crate) not_match_operations: Vec<MergeOperationConfig>,
     /// Operations to perform on target records when they do not pair with a source record
-    not_match_source_operations: Vec<MergeOperationConfig>,
+    pub(crate) not_match_source_operations: Vec<MergeOperationConfig>,
     ///Prefix the source columns with a user provided prefix
-    source_alias: Option<String>,
+    pub(crate) source_alias: Option<String>,
     ///Prefix target columns with a user provided prefix
-    target_alias: Option<String>,
+    pub(crate) target_alias: Option<String>,
     /// A snapshot of the table's state. AKA the target table in the operation
-    snapshot: Option<EagerSnapshot>,
+    pub(crate) snapshot: Option<EagerSnapshot>,
     /// The source data
-    source: DataFrame,
+    pub(crate) source: DataFrame,
     /// Whether the source is a streaming source (if true, stats deducing to prune target is disabled)
-    streaming: bool,
+    pub(crate) streaming: bool,
     /// Enable merge schema evolution
-    merge_schema: bool,
+    pub(crate) merge_schema: bool,
     /// Delta object store for handling data files
-    log_store: LogStoreRef,
+    pub(crate) log_store: LogStoreRef,
     /// Datafusion session state relevant for executing the input plan
-    state: Option<Arc<dyn Session>>,
-    session_fallback_policy: SessionFallbackPolicy,
+    pub(crate) state: Option<Arc<dyn Session>>,
+    pub(crate) session_fallback_policy: SessionFallbackPolicy,
     /// Properties passed to underlying parquet writer for when files are rewritten
-    writer_properties: Option<WriterProperties>,
+    pub(crate) writer_properties: Option<WriterProperties>,
     /// Additional information to add to the commit
-    commit_properties: CommitProperties,
+    pub(crate) commit_properties: CommitProperties,
     /// safe_cast determines how data types that do not match the underlying table are handled
     /// By default an error is returned
-    safe_cast: bool,
-    custom_execute_handler: Option<Arc<dyn CustomExecuteHandler>>,
+    pub(crate) safe_cast: bool,
+    pub(crate) custom_execute_handler: Option<Arc<dyn CustomExecuteHandler>>,
 }
 
 impl super::Operation for MergeBuilder {
