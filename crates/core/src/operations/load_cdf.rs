@@ -149,8 +149,8 @@ impl CdfLoadBuilder {
 
     #[inline]
     fn timestamp_in_range(action: &Action, ts: DateTime<Utc>) -> bool {
-        matches!(action, Action::CommitInfo(CommitInfo { in_commit_timestamp: Some(t), .. }) if ts.timestamp_millis() < *t)
-            || matches!(action, Action::CommitInfo(CommitInfo { timestamp: Some(t), .. }) if ts.timestamp_millis() < *t)
+        matches!(action, Action::CommitInfo(CommitInfo { in_commit_timestamp: Some(t), .. }) if ts.timestamp_millis() <= *t)
+            || matches!(action, Action::CommitInfo(CommitInfo { timestamp: Some(t), .. }) if ts.timestamp_millis() <= *t)
     }
 
     async fn calculate_earliest_version(&self, snapshot: &EagerSnapshot) -> DeltaResult<Version> {
