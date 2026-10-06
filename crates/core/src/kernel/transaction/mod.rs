@@ -94,7 +94,8 @@ use serde::{Deserialize, Serialize};
 use self::conflict_checker::{TransactionInfo, WinningCommitSummary};
 use crate::errors::DeltaTableError;
 use crate::kernel::{
-    Action, CommitInfo, EagerSnapshot, IsolationLevel, Metadata, Protocol, Transaction, Version,
+    Action, CommitInfo, EagerSnapshot, IsolationLevel, Metadata, Protocol, ProtocolExt as _,
+    Transaction, Version,
 };
 use crate::logstore::ObjectStoreRef;
 use crate::logstore::with_operation;
@@ -446,6 +447,34 @@ fn assign_commit_info_metadata(
     commit_info.info = app_metadata.clone();
 }
 
+/// Populate `commitInfo.inCommitTimestamp` when the table has the `InCommitTimestamp` writer
+/// feature enabled. delta-rs otherwise leaves the field unset, which is invalid for such tables
+/// (readers derive commit timestamps from it).
+///
+/// The in-commit timestamp is set to the commit's own `timestamp`. This is monotonically
+/// increasing in the common case (commits are at least a millisecond apart and the clock does
+/// not move backwards); it does not read the previous commit's in-commit timestamp to guarantee
+/// strict monotonicity across sub-millisecond or clock-skewed commits.
+fn maybe_set_in_commit_timestamp(data: &mut CommitData, table_data: Option<&dyn TableReference>) {
+    let has_ict = table_data
+        .and_then(|t| t.protocol().writer_features_set())
+        .map(|features| features.contains(&TableFeature::InCommitTimestamp))
+        .unwrap_or(false);
+    if !has_ict {
+        return;
+    }
+    if let Some(Action::CommitInfo(commit_info)) = data
+        .actions
+        .iter_mut()
+        .find(|action| matches!(action, Action::CommitInfo(_)))
+    {
+        let ts = commit_info
+            .timestamp
+            .unwrap_or_else(|| Utc::now().timestamp_millis());
+        commit_info.in_commit_timestamp = Some(ts);
+    }
+}
+
 impl CommitData {
     /// Create new data to be committed
     pub fn new(
@@ -678,12 +707,13 @@ impl<'a> CommitBuilder {
         log_store: LogStoreRef,
         operation: DeltaOperation,
     ) -> PreCommit<'a> {
-        let data = CommitData::new(
+        let mut data = CommitData::new(
             self.actions,
             operation,
             self.app_metadata,
             self.app_transaction,
         );
+        maybe_set_in_commit_timestamp(&mut data, table_data);
         PreCommit {
             log_store,
             table_data,
